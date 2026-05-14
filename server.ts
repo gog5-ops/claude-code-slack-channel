@@ -18,7 +18,7 @@ import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { execSync } from 'child_process'
 import { homedir } from 'os'
-import { join, resolve } from 'path'
+import { basename, join, resolve } from 'path'
 import {
   readFileSync,
   writeFileSync,
@@ -437,6 +437,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           const uploadArgs: Record<string, any> = {
             channel_id: chatId,
             file: resolved,
+            filename: basename(resolved),
           }
           if (threadTs) uploadArgs.thread_ts = threadTs
           await web.filesUploadV2(uploadArgs as any)
