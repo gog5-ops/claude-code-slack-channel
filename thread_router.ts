@@ -29,7 +29,7 @@ export interface SpawnedProcess {
 export type SpawnAgent = (
   command: string,
   args: string[],
-  options: { cwd: string; detached: true; stdio: 'ignore' },
+  options: { cwd: string; detached: true; stdio: 'ignore'; env: NodeJS.ProcessEnv },
 ) => SpawnedProcess
 
 export interface BuildAgentapiCommandOptions {
@@ -192,6 +192,8 @@ export function buildAgentapiCommand(
       key,
       '--model',
       'claude-opus-4-6[1m]',
+      '--effort',
+      'max',
       '--allowedTools',
       'Read Edit Write Bash',
     ],
@@ -570,7 +572,15 @@ async function activateSession(
   try {
     await mkdir(join(stateDir, 'sessions'), { recursive: true, mode: 0o700 })
     await unlinkFatalStartupStateFile(stateDir, key)
-    const child = spawnAgent(command, args, { cwd, detached: true, stdio: 'ignore' })
+    const child = spawnAgent(command, args, {
+      cwd,
+      detached: true,
+      stdio: 'ignore',
+      env: {
+        ...process.env,
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '0.80',
+      },
+    })
     child.unref?.()
     const pid = child.pid || 0
     await waitForAgentHealthy(claim.port, options, key, stateDir)
@@ -907,7 +917,7 @@ async function fetchJson<T>(
 function defaultSpawnAgent(
   command: string,
   args: string[],
-  options: { cwd: string; detached: true; stdio: 'ignore' },
+  options: { cwd: string; detached: true; stdio: 'ignore'; env: NodeJS.ProcessEnv },
 ): ChildProcess {
   return nodeSpawn(command, args, options)
 }

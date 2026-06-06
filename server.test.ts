@@ -1831,6 +1831,23 @@ describe('thread_router agentapi command', () => {
       claudeProjectSessionJsonlPath(tmpRoot, claudeSessionId, claudeProjectsDir),
     ])
   })
+
+  test('sets Claude model effort without adding Slack server ownership', () => {
+    const key = buildSessionKey('C_CMD', '1700000000.000400')
+    const { args } = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+    })
+
+    expect(args).toContain('--model')
+    expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-4-6[1m]')
+    expect(args).toContain('--effort')
+    expect(args[args.indexOf('--effort') + 1]).toBe('max')
+    expect(args).toContain('--allowedTools')
+    expect(args[args.indexOf('--allowedTools') + 1]).toBe('Read Edit Write Bash')
+    expect(args).not.toContain('server:slack')
+    expect(args).not.toContain('--dangerously-load-development-channels')
+  })
 })
 
 describe('thread_router ensureSession', () => {
@@ -1846,9 +1863,9 @@ describe('thread_router ensureSession', () => {
   })
 
   test('single-flights concurrent activation for the same key', async () => {
-    const spawnCalls: Array<{ command: string; args: string[] }> = []
-    const spawnAgent: SpawnAgent = (command, args) => {
-      spawnCalls.push({ command, args })
+    const spawnCalls: Array<{ command: string; args: string[]; options: Parameters<SpawnAgent>[2] }> = []
+    const spawnAgent: SpawnAgent = (command, args, options) => {
+      spawnCalls.push({ command, args, options })
       return { pid: 4321, unref: () => {} }
     }
     const fetchOk = async () =>
@@ -1884,6 +1901,7 @@ describe('thread_router ensureSession', () => {
     expect(spawnCalls[0]!.args).toContain('--allowedTools')
     expect(spawnCalls[0]!.args).toContain('Read Edit Write Bash')
     expect(spawnCalls[0]!.args).not.toContain('--dangerously-skip-permissions')
+    expect(spawnCalls[0]!.options.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE']).toBe('0.80')
 
     const registry = await readRegistry(tmpRoot)
     expect(registry['C_SINGLE:1700000000.000100']?.status).toBe('active')
