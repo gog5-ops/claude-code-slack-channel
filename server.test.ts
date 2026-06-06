@@ -669,22 +669,23 @@ describe('assertOutboundAllowed', () => {
     ).toThrow('Outbound gate')
   })
 
-  test('requires exact registry key when thread_ts is provided', () => {
+  test('allows any thread_ts in a channel with an active thread session registry entry', () => {
     const access = makeAccess({ channels: {} })
     const registry = {
-      'D0ATZTYC3KN:1800000000.000001': { status: 'activating' },
+      'D0ATZTYC3KN:current': { status: 'active' },
     }
 
     expect(() =>
       assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
         activeThreadRegistry: registry,
-        threadTs: '1800000000.000001',
+        threadTs: 'other',
       }),
     ).not.toThrow()
+
     expect(() =>
-      assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
+      assertOutboundAllowed('C_UNKNOWN', access, new Set(), {
         activeThreadRegistry: registry,
-        threadTs: '1800000000.000002',
+        threadTs: 'other',
       }),
     ).toThrow('Outbound gate')
   })
@@ -698,6 +699,7 @@ describe('assertOutboundAllowed', () => {
     expect(() =>
       assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
         activeThreadRegistry: registry,
+        threadTs: '1800000000.000002',
       }),
     ).toThrow('Outbound gate')
   })

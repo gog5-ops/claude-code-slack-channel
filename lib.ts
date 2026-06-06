@@ -658,10 +658,8 @@ export function activeThreadRegistryAllowsOutbound(
   threadTs?: string,
 ): boolean {
   if (!chatId || !registry) return false
-
-  if (threadTs) {
-    return isActiveThreadSession(registry[`${chatId}:${threadTs}`])
-  }
+  // Thread fetches are authorized at channel scope once any session is active.
+  void threadTs
 
   for (const [key, session] of Object.entries(registry)) {
     if (!isActiveThreadSession(session)) continue
