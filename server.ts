@@ -41,6 +41,7 @@ import {
   isSlackFileUrl,
   chunkText,
   planReplyDelivery,
+  DELIVERY_FAILURE_NOTICE,
   sanitizeFilename,
   sanitizeDisplayName,
   gate as libGate,
@@ -1020,37 +1021,71 @@ async function deliverToSession(
     throw new Error('deliverToSession requires meta.chat_id and meta.thread_ts or meta.ts')
   }
 
-  const session = await ensureSession(chatId, threadTs)
-  const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
-  // While the worker is running, edit the progress message in place with a
-  // rate-limited heartbeat showing Claude Code's live status verb. The main
-  // router is the only Slack outbound sender; the thread session's own Slack
-  // MCP stays read-only.
-  const onHeartbeat = progressTs
-    ? (info: HeartbeatInfo) => {
-        web.chat.update({
-          channel: chatId,
-          ts: progressTs,
-          text: buildHeartbeatMessage(info),
-        }).catch(() => {})
-      }
-    : undefined
-  const replyText = await forwardMessage(
-    session.port,
-    text,
-    { includeSlackContext, onHeartbeat },
-    meta,
-  )
+  // A forward-phase failure (activation race, agentapi POST/forward error) leaves
+  // the "Working…" placeholder untouched — finalize it to a failure notice so the
+  // user isn't stranded forever. The transient "waiting for user input" POST race
+  // is already retried inside forwardMessage (opshub#155, Phase 5 follow-up).
+  let port: number | undefined
+  let replyText = ''
+  try {
+    const session = await ensureSession(chatId, threadTs)
+    port = session.port
+    const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
+    // While the worker is running, edit the progress message in place with a
+    // rate-limited heartbeat showing Claude Code's live status verb. The main
+    // router is the only Slack outbound sender; the thread session's own Slack
+    // MCP stays read-only.
+    const onHeartbeat = progressTs
+      ? (info: HeartbeatInfo) => {
+          web.chat.update({
+            channel: chatId,
+            ts: progressTs,
+            text: buildHeartbeatMessage(info),
+          }).catch(() => {})
+        }
+      : undefined
+    replyText = await forwardMessage(
+      session.port,
+      text,
+      { includeSlackContext, onHeartbeat },
+      meta,
+    )
+  } catch (err) {
+    // Diagnostics (no secrets): "forward failed" plus the error message lets
+    // Hermes attribute the failure (agentapi POST vs activation); `port` is set
+    // only once a session was acquired.
+    const detail = err instanceof Error ? err.message : String(err)
+    console.error(
+      `[slack] deliverToSession forward failed key=${chatId}:${threadTs}${port ? ` port=${port}` : ''}: ${detail}`,
+    )
+    // The placeholder is still "Working…" (no reply was produced); convert it to
+    // a concise failure notice so the user knows to resend.
+    if (progressTs) {
+      await web.chat
+        .update({ channel: chatId, ts: progressTs, text: DELIVERY_FAILURE_NOTICE })
+        .catch(() => {})
+    }
+    return
+  }
 
   // Finalize the progress placeholder in place instead of posting a separate
-  // message and leaving "Working…" stranded. An empty reply turns the
-  // placeholder into a terminal notice (opshub#155, Phase 5 follow-up).
-  await sendReplyToSlack({
-    chatId,
-    text: replyText,
-    threadTs,
-    editTs: progressTs,
-  })
+  // message and leaving "Working…" stranded; an empty reply turns it into a
+  // terminal notice. sendReplyToSlack falls back to a fresh post if the first
+  // chunk's update fails, so on a send error we log but never overwrite content
+  // that may already have been delivered.
+  try {
+    await sendReplyToSlack({
+      chatId,
+      text: replyText,
+      threadTs,
+      editTs: progressTs,
+    })
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    console.error(
+      `[slack] deliverToSession send failed key=${chatId}:${threadTs}${port ? ` port=${port}` : ''}: ${detail}`,
+    )
+  }
 }
 
 async function downloadSlackFiles(messageTs: string, files: any[]): Promise<string[]> {

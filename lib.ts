@@ -754,6 +754,12 @@ export function chunkText(text: string, limit: number, mode: 'length' | 'newline
 // finishes with no reply text to send (opshub#155, Phase 5 follow-up).
 export const EMPTY_REPLY_NOTICE = '(no reply)'
 
+// Shown in place of the progress placeholder when delivery to the thread worker
+// throws (POST/forward failure, activation race, or a Slack write error) so the
+// user is never stranded on an endless "Working…" (opshub#155, Phase 5 follow-up).
+export const DELIVERY_FAILURE_NOTICE =
+  '⚠️ Failed to deliver to the thread worker — please send your message again.'
+
 // A single Slack write the main router makes to deliver a finalized reply:
 // either update an existing message (the progress placeholder) or post a new
 // in-thread message.

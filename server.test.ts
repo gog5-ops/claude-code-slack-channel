@@ -2457,6 +2457,49 @@ describe('thread_router forwardMessage', () => {
     ])
   })
 
+  test('propagates a non-transient agentapi POST failure instead of retrying forever', async () => {
+    // A non-transient POST failure must be bounded (no endless retry) and must
+    // propagate, so the caller (deliverToSession) can finalize the "Working…"
+    // placeholder into a failure notice rather than leaving it forever. The
+    // transient "waiting for user input" race is covered by the retry test
+    // above (opshub#155, Phase 5 follow-up).
+    const calls: string[] = []
+    const fetchMock = async (url: string) => {
+      calls.push(new URL(url).pathname)
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ detail: 'internal server error' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(JSON.stringify({ messages: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    let threw: unknown
+    try {
+      await forwardMessage(3099, 'hello', { fetch: fetchMock, statusPollMs: 1 })
+    } catch (err) {
+      threw = err
+    }
+
+    expect(threw).toBeInstanceOf(Error)
+    expect((threw as Error).message).toMatch(/agentapi request failed/)
+    // Bounded: the non-transient failure is not retried, so /message is hit once.
+    expect(calls.filter((path) => path === '/message')).toHaveLength(1)
+  })
+
   test('falls back to Claude project JSONL when AgentAPI messages are context-only', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-jsonl-fallback-'))
     const cwd = join(rawRoot, 'repo')
