@@ -51,7 +51,7 @@ import {
   type GateResult,
   type OutboundThreadRegistry,
 } from './lib.ts'
-import { buildHeartbeatMessage, claimSlackContextForSession, ensureSession, forwardMessage } from './thread_router.ts'
+import { buildHeartbeatMessage, claimSlackContextForSession, ensureSession, forwardMessage, type HeartbeatInfo } from './thread_router.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -992,7 +992,7 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 async function deliverToSession(
   text: string,
   meta: Record<string, string>,
-  thinkingTs?: string,
+  progressTs?: string,
 ): Promise<void> {
   const chatId = meta.chat_id
   const threadTs = meta.thread_ts || meta.ts
@@ -1002,14 +1002,15 @@ async function deliverToSession(
 
   const session = await ensureSession(chatId, threadTs)
   const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
-  // While the worker is running, edit the "💭 Thinking…" message in place with a
-  // rate-limited heartbeat. The main router is the only Slack outbound sender;
-  // the thread session's own Slack MCP stays read-only.
-  const onHeartbeat = thinkingTs
-    ? (info: { contextUsage?: string }) => {
+  // While the worker is running, edit the progress message in place with a
+  // rate-limited heartbeat showing Claude Code's live status verb. The main
+  // router is the only Slack outbound sender; the thread session's own Slack
+  // MCP stays read-only.
+  const onHeartbeat = progressTs
+    ? (info: HeartbeatInfo) => {
         web.chat.update({
           channel: chatId,
-          ts: thinkingTs,
+          ts: progressTs,
           text: buildHeartbeatMessage(info),
         }).catch(() => {})
       }
@@ -1213,21 +1214,21 @@ async function handleMessage(event: unknown): Promise<void> {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
 
-      // Send thinking indicator to Slack before forwarding to Claude. Capture its
-      // ts so the thread router's heartbeat can edit it in place (no new messages).
-      const thinkingThreadTs = (ev['thread_ts'] as string | undefined) || (ev['ts'] as string)
-      let thinkingTs: string | undefined
+      // Post a progress placeholder before forwarding to Claude. Capture its ts
+      // so the thread router's heartbeat can edit it in place (no new messages).
+      const progressThreadTs = (ev['thread_ts'] as string | undefined) || (ev['ts'] as string)
+      let progressTs: string | undefined
       try {
         const posted = await web.chat.postMessage({
           channel: ev['channel'] as string,
-          text: '💭 Thinking...',
-          thread_ts: thinkingThreadTs,
+          text: buildHeartbeatMessage(),
+          thread_ts: progressThreadTs,
         })
-        thinkingTs = posted.ts as string | undefined
+        progressTs = posted.ts as string | undefined
       } catch { /* non-critical */ }
 
       // Deliver into the thread-scoped agentapi session.
-      await deliverToSession(text, meta, thinkingTs)
+      await deliverToSession(text, meta, progressTs)
     }
   }
 }

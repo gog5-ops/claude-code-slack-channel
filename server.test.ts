@@ -2740,32 +2740,47 @@ describe('thread_router forwardMessage', () => {
 // Phase 5 (opshub#155) — progress heartbeat sanitizer
 //
 // While the thread worker's agentapi status is `running`, the main router edits
-// the "💭 Thinking…" message in place. buildHeartbeatMessage produces that text:
-// terminal-style "still working", a normalized "N% context used" tail when one
-// is available, and never raw TUI content (no spam).
+// the progress message in place. buildHeartbeatMessage formats it from the live
+// Claude Code TUI status verb when one is visible (e.g. "Ruminating…"), preserves
+// a normalized "N% context used" tail, never emits the word "Thinking", and falls
+// back to a neutral terminal-style "Working…" when no status is available.
 // ---------------------------------------------------------------------------
 
 describe('thread_router buildHeartbeatMessage', () => {
-  test('returns terminal-style still-working text when no context usage is known', () => {
-    expect(buildHeartbeatMessage()).toBe('💭 Still working…')
+  test('falls back to a neutral Working… phrase when no status or context is known', () => {
+    expect(buildHeartbeatMessage()).toBe('Working…')
   })
 
-  test('appends a normalized context-usage tail', () => {
-    expect(buildHeartbeatMessage({ contextUsage: '8% context used' })).toBe(
-      '💭 Still working… · 8% context used',
+  test('uses the live TUI status verb when visible', () => {
+    expect(buildHeartbeatMessage({ status: '✶ Ruminating… (51s · esc to interrupt)' })).toBe(
+      'Ruminating…',
     )
   })
 
-  test('extracts only the context figure from TUI-laden input (no spam)', () => {
+  test('appends a normalized context-usage tail to the live status', () => {
+    expect(
+      buildHeartbeatMessage({ status: '✻ Crunching… (8s)', contextUsage: '8% context used' }),
+    ).toBe('Crunching… · 8% context used')
+  })
+
+  test('appends context usage to the neutral fallback when no status is visible', () => {
+    expect(buildHeartbeatMessage({ contextUsage: '8% context used' })).toBe('Working… · 8% context used')
+  })
+
+  test('extracts only the context figure from TUI-laden context input (no spam)', () => {
     expect(
       buildHeartbeatMessage({ contextUsage: '✶ Ruminating… (51s...) ... 16% context used' }),
-    ).toBe('💭 Still working… · 16% context used')
+    ).toBe('Working… · 16% context used')
   })
 
-  test('drops unparseable context usage', () => {
-    expect(buildHeartbeatMessage({ contextUsage: 'garbage with no figure' })).toBe(
-      '💭 Still working…',
-    )
+  test('never emits the word Thinking — falls back to Working…', () => {
+    expect(
+      buildHeartbeatMessage({ status: '✶ Thinking… (3s)', contextUsage: '5% context used' }),
+    ).toBe('Working… · 5% context used')
+  })
+
+  test('drops unparseable status and context', () => {
+    expect(buildHeartbeatMessage({ status: 'no spinner here', contextUsage: 'garbage' })).toBe('Working…')
   })
 })
 
@@ -3112,46 +3127,61 @@ describe('thread_router forwardMessage heartbeat', () => {
     }
   }
 
-  test('emits a heartbeat with normalized context usage while the agent is running', async () => {
-    const heartbeats: Array<{ contextUsage?: string }> = []
+  test('emits a heartbeat reflecting the live TUI status verb while the agent is running', async () => {
+    const heartbeats: string[] = []
     const reply = await forwardMessage(3099, 'hello', {
-      fetch: heartbeatFetch(['running', 'stable'], 'the answer\n\n23% context used'),
+      fetch: heartbeatFetch(['running', 'stable'], '✶ Ruminating… (51s)\n\nthe answer\n\n23% context used'),
       statusPollMs: 1,
       messageSettleMs: 0,
       heartbeatMs: 0,
       onHeartbeat: (info) => {
-        heartbeats.push(info)
+        heartbeats.push(buildHeartbeatMessage(info))
       },
     })
 
     expect(reply).toContain('the answer')
-    expect(heartbeats).toEqual([{ contextUsage: '23% context used' }])
+    expect(heartbeats).toEqual(['Ruminating… · 23% context used'])
+  })
+
+  test('falls back to a neutral phrase when no TUI status verb is visible', async () => {
+    const heartbeats: string[] = []
+    await forwardMessage(3099, 'hello', {
+      fetch: heartbeatFetch(['running', 'stable'], 'the answer\n\n7% context used'),
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      heartbeatMs: 0,
+      onHeartbeat: (info) => {
+        heartbeats.push(buildHeartbeatMessage(info))
+      },
+    })
+
+    expect(heartbeats).toEqual(['Working… · 7% context used'])
   })
 
   test('rate-limits heartbeats across consecutive running polls', async () => {
-    const heartbeats: Array<{ contextUsage?: string }> = []
+    const heartbeats: string[] = []
     await forwardMessage(3099, 'hello', {
-      fetch: heartbeatFetch(['running', 'running', 'stable'], 'still going\n\n5% context used'),
+      fetch: heartbeatFetch(['running', 'running', 'stable'], '✻ Crunching… (8s)\n\nstill going\n\n5% context used'),
       statusPollMs: 1,
       messageSettleMs: 0,
       heartbeatMs: 100_000,
       onHeartbeat: (info) => {
-        heartbeats.push(info)
+        heartbeats.push(buildHeartbeatMessage(info))
       },
     })
 
-    expect(heartbeats).toHaveLength(1)
+    expect(heartbeats).toEqual(['Crunching… · 5% context used'])
   })
 
   test('does not emit heartbeats when the agent is already stable', async () => {
-    const heartbeats: Array<{ contextUsage?: string }> = []
+    const heartbeats: string[] = []
     await forwardMessage(3099, 'hello', {
       fetch: heartbeatFetch(['stable'], 'instant answer'),
       statusPollMs: 1,
       messageSettleMs: 0,
       heartbeatMs: 0,
       onHeartbeat: (info) => {
-        heartbeats.push(info)
+        heartbeats.push(buildHeartbeatMessage(info))
       },
     })
 

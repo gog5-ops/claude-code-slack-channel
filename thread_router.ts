@@ -90,7 +90,7 @@ const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000
 const DEFAULT_STATUS_POLL_MS = 1_000
 const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
 const DEFAULT_MESSAGE_SETTLE_MS = 750
-const DEFAULT_HEARTBEAT_MS = 10_000
+const DEFAULT_HEARTBEAT_MS = 30_000
 const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
 const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 5_000
 const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
@@ -102,6 +102,11 @@ const TUI_TIMED_STATUS_RE =
   /^[✻✶✱✢]\s+.*\bfor\s+\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b/i
 const TUI_TOOL_STATUS_RE = /^(?:Ran|Searched|Called)\b(?:\s|:|$)/
 const TUI_TRANSIENT_STATUS_RE = /^[✻✶✱✢]?\s*(?:Ruminating|Thinking)(?:…|\.\.\.)(?:\s|$|\()/i
+// Live Claude Code spinner status line ("✶ Ruminating… (51s · esc to interrupt)")
+// and the gerund verb within it. Used by the progress heartbeat to surface the
+// current visible status instead of a generic label (opshub#155, Phase 5).
+const TUI_STATUS_GLYPH_RE = /^[✻✶✱✢]\s/
+const HEARTBEAT_STATUS_VERB_RE = /[✻✶✱✢*]?\s*([A-Za-z][A-Za-z ]*?)\s*(?:…|\.{3})/
 const SLACK_INBOUND_ECHO_RE = /^←\s*slack\s*·\s*/i
 const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
 const CONTEXT_USAGE_RE = /^(\d+%)\s+context used$/i
@@ -394,16 +399,28 @@ function appendContextUsageLine(reply: string, contextUsageLine: string | undefi
 }
 
 export interface HeartbeatInfo {
+  // Raw current visible Claude Code TUI status line, if any (e.g. "✶ Ruminating…").
+  status?: string
+  // Raw or normalized context-usage text; the parseable figure is extracted.
   contextUsage?: string
 }
 
-// Text for the in-place "still working" heartbeat the main router shows while a
-// thread worker is busy. Terminal-style, with a normalized "N% context used"
-// tail only when a figure is parseable — never raw TUI content (no spam).
+// Text for the in-place progress heartbeat the main router shows while a thread
+// worker is busy. Prefers the live TUI status verb (e.g. "Ruminating…"); falls
+// back to a neutral terminal-style "Working…". Never emits "Thinking" and never
+// echoes raw TUI content (no spam). Appends a normalized "N% context used" tail
+// when a figure is parseable.
 export function buildHeartbeatMessage(info: HeartbeatInfo = {}): string {
-  const base = '💭 Still working…'
+  const phrase = heartbeatStatusPhrase(info.status) ?? 'Working…'
   const match = info.contextUsage?.match(/(\d+%)\s+context used/i)
-  return match ? `${base} · ${match[1]} context used` : base
+  return match ? `${phrase} · ${match[1]} context used` : phrase
+}
+
+function heartbeatStatusPhrase(status: string | undefined): string | undefined {
+  if (!status) return undefined
+  const verb = status.match(HEARTBEAT_STATUS_VERB_RE)?.[1]?.trim()
+  if (!verb || /^thinking$/i.test(verb)) return undefined
+  return `${verb}…`
 }
 
 async function fetchLatestClaudeJsonlAssistantText(
@@ -974,8 +991,8 @@ async function waitForStable(
       const at = Date.now()
       if (at >= nextHeartbeatAt) {
         nextHeartbeatAt = at + heartbeatMs
-        const contextUsage = await currentContextUsage(port, options)
-        void Promise.resolve(onHeartbeat({ contextUsage })).catch(() => {})
+        const info = await currentHeartbeatInfo(port, options)
+        void Promise.resolve(onHeartbeat(info)).catch(() => {})
       }
     }
     await sleep(pollMs)
@@ -984,16 +1001,26 @@ async function waitForStable(
   throw new Error(`Timed out waiting for agentapi to become stable on port ${port}`)
 }
 
-async function currentContextUsage(
+async function currentHeartbeatInfo(
   port: number,
   options: ThreadRouterOptions,
-): Promise<string | undefined> {
+): Promise<HeartbeatInfo> {
   try {
     const content = await fetchLatestAgentMessageContent(port, options)
-    return content ? latestContextUsageLine(content) : undefined
+    if (!content) return {}
+    return { status: latestStatusLine(content), contextUsage: latestContextUsageLine(content) }
   } catch {
-    return undefined
+    return {}
   }
+}
+
+function latestStatusLine(content: string): string | undefined {
+  let latest: string | undefined
+  for (const raw of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trim()
+    if (TUI_STATUS_GLYPH_RE.test(line)) latest = line
+  }
+  return latest
 }
 
 export async function getAgentStatus(
