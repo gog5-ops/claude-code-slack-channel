@@ -2287,6 +2287,72 @@ describe('thread_router forwardMessage', () => {
     })
   })
 
+  test('retries transient startup POST /message waiting-for-user-input error', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    let messagePosts = 0
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      calls.push({ url, init })
+      if (url.endsWith('/message')) {
+        messagePosts += 1
+        if (messagePosts === 1) {
+          return new Response(
+            JSON.stringify({
+              detail: 'failed to send message: message can only be sent when the agent is waiting for user input',
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                id: 1,
+                role: 'user',
+                content: 'hello',
+                time: '2026-06-06T00:00:00.000Z',
+              },
+              {
+                id: 2,
+                role: 'agent',
+                content: 'hello from agent',
+                time: '2026-06-06T00:00:01.000Z',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+    })
+
+    expect(reply).toBe('hello from agent')
+    expect(messagePosts).toBe(2)
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      '/message',
+      '/message',
+      '/status',
+      '/messages',
+      '/messages',
+    ])
+  })
+
   test('falls back to Claude project JSONL when AgentAPI messages are context-only', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-jsonl-fallback-'))
     const cwd = join(rawRoot, 'repo')

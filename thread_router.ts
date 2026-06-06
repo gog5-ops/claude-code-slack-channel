@@ -89,6 +89,8 @@ const DEFAULT_STATUS_POLL_MS = 1_000
 const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
 const DEFAULT_MESSAGE_SETTLE_MS = 750
 const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
+const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 5_000
+const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
 const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
@@ -103,6 +105,7 @@ const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?)
 const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 const CLAUDE_PROJECT_SAFE_CHAR_RE = /[^A-Za-z0-9_-]/g
 const CLAUDE_SESSION_ALREADY_IN_USE_RE = /Error:\s+Session ID [0-9a-f-]+ is already in use\./i
+const AGENT_WAITING_FOR_USER_INPUT_RE = /message can only be sent when the agent is waiting for user input/i
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -291,11 +294,11 @@ export async function forwardMessage(
     ? await captureClaudeJsonlFallbackState(meta, options)
     : undefined
 
-  await fetchJson<{ ok?: boolean }>(fetchImpl, `${baseUrl}/message`, {
+  await postAgentMessageWithRetry(fetchImpl, `${baseUrl}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content: forwardedContent, type: 'user' }),
-  })
+  }, options)
 
   await waitForStable(port, options)
 
@@ -1026,6 +1029,37 @@ async function fetchJson<T>(
     throw new Error(`agentapi request failed: ${response.status} ${response.statusText}`)
   }
   return await response.json() as T
+}
+
+async function postAgentMessageWithRetry<T>(
+  fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
+  url: string,
+  init: RequestInit,
+  options: ThreadRouterOptions,
+): Promise<T> {
+  const deadline = Date.now() + DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS
+  const pollMs = Math.max(
+    1,
+    Math.min(options.statusPollMs || DEFAULT_MESSAGE_POST_RETRY_POLL_MS, DEFAULT_MESSAGE_POST_RETRY_POLL_MS),
+  )
+
+  while (true) {
+    const response = await fetchImpl(url, init)
+    const rawBody = await response.text()
+    if (response.ok) {
+      return (rawBody ? JSON.parse(rawBody) : {}) as T
+    }
+
+    const isTransientStartupRace =
+      response.status === 500 && AGENT_WAITING_FOR_USER_INPUT_RE.test(rawBody)
+    const remainingMs = deadline - Date.now()
+    if (!isTransientStartupRace || remainingMs <= 0) {
+      const detail = rawBody.trim() ? `: ${rawBody.trim()}` : ''
+      throw new Error(`agentapi request failed: ${response.status} ${response.statusText}${detail}`)
+    }
+
+    await sleep(Math.min(pollMs, remainingMs))
+  }
 }
 
 function defaultSpawnAgent(
