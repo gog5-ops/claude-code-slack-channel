@@ -58,6 +58,8 @@ export interface ThreadRouterOptions {
   messageSettleMs?: number
   includeSlackContext?: boolean
   claudeProjectsDir?: string
+  heartbeatMs?: number
+  onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>
 }
 
 interface AgentStatusBody {
@@ -88,6 +90,7 @@ const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000
 const DEFAULT_STATUS_POLL_MS = 1_000
 const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
 const DEFAULT_MESSAGE_SETTLE_MS = 750
+const DEFAULT_HEARTBEAT_MS = 10_000
 const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
 const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 5_000
 const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
@@ -108,6 +111,12 @@ const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 const CLAUDE_PROJECT_SAFE_CHAR_RE = /[^A-Za-z0-9_-]/g
 const CLAUDE_SESSION_ALREADY_IN_USE_RE = /Error:\s+Session ID [0-9a-f-]+ is already in use\./i
 const AGENT_WAITING_FOR_USER_INPUT_RE = /message can only be sent when the agent is waiting for user input/i
+// Signatures of the Claude startup / setup / context-index TUI screen that a
+// fresh worker shows before it has replied to the just-posted message. These
+// survive sanitizeAgentReply, so we detect them to avoid posting them as a
+// reply. Captured from a real worker .state file (opshub#155, Phase 5).
+const STARTUP_ARTIFACT_RE =
+  /SessionStart:|Settings Warning|\bsetup issues:|Context Index:|\$CMEM\b|❯\s*\d+\.\s|^[ \t]*[─━]{20,}[ \t]*$/m
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -302,18 +311,29 @@ export async function forwardMessage(
     body: JSON.stringify({ content: forwardedContent, type: 'user' }),
   }, options)
 
-  await waitForStable(port, options)
+  await waitForStable(port, options, options.onHeartbeat)
 
   const content = await waitForSettledAgentMessageContent(port, options)
   const sanitized = sanitizeAgentReply(content)
   const contextUsageLine = latestContextUsageLine(content)
-  if (!replyNeedsJsonlFallback(sanitized)) return sanitized
+  // A fresh worker's first /messages snapshot can be the Claude startup /
+  // context-index screen rather than a reply to the just-posted message. Treat
+  // it (alongside empty/context-only content) as "no real reply yet" and prefer
+  // the session JSONL, which is keyed to the posted message. Only when we have a
+  // JSONL to fall back to, so a startup false-positive can never drop a reply.
+  const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
+  if (!replyNeedsJsonlFallback(sanitized) && !isStartupArtifact) return sanitized
 
   const jsonlContent = jsonlFallbackState
     ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
     : undefined
   const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
   if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
+
+  // No real reply from AgentAPI or the JSONL. Never post the raw startup /
+  // context-index screen; surface the normalized context-usage line alone if we
+  // have one, else empty (deliverToSession skips empty replies).
+  if (isStartupArtifact) return contextUsageLine ?? ''
   return sanitized
 }
 
@@ -352,6 +372,10 @@ function replyNeedsJsonlFallback(reply: string): boolean {
   return trimmed.split('\n').every((line) => CONTEXT_USAGE_RE.test(line.trim()))
 }
 
+export function replyIsStartupArtifact(content: string): boolean {
+  return STARTUP_ARTIFACT_RE.test(content)
+}
+
 function latestContextUsageLine(content: string): string | undefined {
   let latest: string | undefined
   CONTEXT_USAGE_ANYWHERE_RE.lastIndex = 0
@@ -367,6 +391,19 @@ function appendContextUsageLine(reply: string, contextUsageLine: string | undefi
   if (!contextUsageLine || !trimmed) return trimmed
   if (trimmed.split('\n').some((line) => line.trim() === contextUsageLine)) return trimmed
   return `${trimmed}\n\n${contextUsageLine}`
+}
+
+export interface HeartbeatInfo {
+  contextUsage?: string
+}
+
+// Text for the in-place "still working" heartbeat the main router shows while a
+// thread worker is busy. Terminal-style, with a normalized "N% context used"
+// tail only when a figure is parseable — never raw TUI content (no spam).
+export function buildHeartbeatMessage(info: HeartbeatInfo = {}): string {
+  const base = '💭 Still working…'
+  const match = info.contextUsage?.match(/(\d+%)\s+context used/i)
+  return match ? `${base} · ${match[1]} context used` : base
 }
 
 async function fetchLatestClaudeJsonlAssistantText(
@@ -667,11 +704,58 @@ export async function cleanupIdle(
   })
 }
 
+export async function reapFakeActiveSessions(
+  options: ThreadRouterOptions = {},
+): Promise<string[]> {
+  const stateDir = options.stateDir || defaultStateDir()
+  const now = options.now || Date.now
+
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const reaped: string[] = []
+
+    for (const [key, session] of Object.entries(registry)) {
+      if (session.status !== 'active' && session.status !== 'activating') continue
+      if (!(await isFakeActiveSession(session, options))) continue
+      registry[key] = {
+        ...session,
+        pid: 0,
+        status: 'dead',
+        last_active_at: new Date(now()).toISOString(),
+      }
+      reaped.push(key)
+    }
+
+    if (reaped.length) {
+      await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    }
+    return reaped
+  })
+}
+
+// A session is fake-active when its registry status claims active/activating
+// but the worker is gone: a recorded pid that is no longer alive, or — for an
+// already-active session — a port nothing is listening on (a free/bindable port
+// means the agentapi released it). Activating sessions skip the port probe:
+// their agentapi may not have bound the port yet.
+async function isFakeActiveSession(
+  session: ThreadSession,
+  options: ThreadRouterOptions,
+): Promise<boolean> {
+  if (session.pid > 0 && !isPidAlive(session.pid, options)) return true
+  if (session.status === 'active') {
+    const portIsAvailable = options.portIsAvailable || defaultPortIsAvailable
+    if (await portIsAvailable(session.port)) return true
+  }
+  return false
+}
+
 async function ensureSessionUnshared(
   key: string,
   options: ThreadRouterOptions,
   stateDir: string,
 ): Promise<ThreadSession> {
+  await reapFakeActiveSessions({ ...options, stateDir })
   const existing = await readRegistry(stateDir).then((registry) => registry[key])
   if (existing?.status === 'active') {
     if (await isThreadSessionHealthy(key, existing, options, stateDir)) {
@@ -873,17 +957,43 @@ async function waitForAgentHealthy(
 async function waitForStable(
   port: number,
   options: ThreadRouterOptions,
+  onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>,
 ): Promise<void> {
   const deadline = Date.now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
   const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
+  const heartbeatMs = Math.max(0, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
+  let nextHeartbeatAt = 0
 
   while (Date.now() <= deadline) {
     const status = await getAgentStatus(port, options)
     if (status === 'stable') return
+    // status === 'running': emit a rate-limited progress heartbeat. The first
+    // running poll fires immediately (liveness); later ones are throttled to
+    // heartbeatMs. Best-effort context usage; failures never break the wait.
+    if (onHeartbeat) {
+      const at = Date.now()
+      if (at >= nextHeartbeatAt) {
+        nextHeartbeatAt = at + heartbeatMs
+        const contextUsage = await currentContextUsage(port, options)
+        void Promise.resolve(onHeartbeat({ contextUsage })).catch(() => {})
+      }
+    }
     await sleep(pollMs)
   }
 
   throw new Error(`Timed out waiting for agentapi to become stable on port ${port}`)
+}
+
+async function currentContextUsage(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  try {
+    const content = await fetchLatestAgentMessageContent(port, options)
+    return content ? latestContextUsageLine(content) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export async function getAgentStatus(

@@ -51,7 +51,7 @@ import {
   type GateResult,
   type OutboundThreadRegistry,
 } from './lib.ts'
-import { claimSlackContextForSession, ensureSession, forwardMessage } from './thread_router.ts'
+import { buildHeartbeatMessage, claimSlackContextForSession, ensureSession, forwardMessage } from './thread_router.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -989,7 +989,11 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 // PERMISSION_REPLY_RE imported from lib.ts — shared with gate() for
 // peer-bot permission-reply blocking.
 
-async function deliverToSession(text: string, meta: Record<string, string>): Promise<void> {
+async function deliverToSession(
+  text: string,
+  meta: Record<string, string>,
+  thinkingTs?: string,
+): Promise<void> {
   const chatId = meta.chat_id
   const threadTs = meta.thread_ts || meta.ts
   if (!chatId || !threadTs) {
@@ -998,7 +1002,24 @@ async function deliverToSession(text: string, meta: Record<string, string>): Pro
 
   const session = await ensureSession(chatId, threadTs)
   const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
-  const replyText = await forwardMessage(session.port, text, { includeSlackContext }, meta)
+  // While the worker is running, edit the "💭 Thinking…" message in place with a
+  // rate-limited heartbeat. The main router is the only Slack outbound sender;
+  // the thread session's own Slack MCP stays read-only.
+  const onHeartbeat = thinkingTs
+    ? (info: { contextUsage?: string }) => {
+        web.chat.update({
+          channel: chatId,
+          ts: thinkingTs,
+          text: buildHeartbeatMessage(info),
+        }).catch(() => {})
+      }
+    : undefined
+  const replyText = await forwardMessage(
+    session.port,
+    text,
+    { includeSlackContext, onHeartbeat },
+    meta,
+  )
   if (!replyText.trim()) return
 
   await sendReplyToSlack({
@@ -1192,16 +1213,21 @@ async function handleMessage(event: unknown): Promise<void> {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
 
-      // Send thinking indicator to Slack before forwarding to Claude
+      // Send thinking indicator to Slack before forwarding to Claude. Capture its
+      // ts so the thread router's heartbeat can edit it in place (no new messages).
       const thinkingThreadTs = (ev['thread_ts'] as string | undefined) || (ev['ts'] as string)
-      web.chat.postMessage({
-        channel: ev['channel'] as string,
-        text: '💭 Thinking...',
-        thread_ts: thinkingThreadTs,
-      }).catch(() => {})
+      let thinkingTs: string | undefined
+      try {
+        const posted = await web.chat.postMessage({
+          channel: ev['channel'] as string,
+          text: '💭 Thinking...',
+          thread_ts: thinkingThreadTs,
+        })
+        thinkingTs = posted.ts as string | undefined
+      } catch { /* non-critical */ }
 
       // Deliver into the thread-scoped agentapi session.
-      await deliverToSession(text, meta)
+      await deliverToSession(text, meta, thinkingTs)
     }
   }
 }

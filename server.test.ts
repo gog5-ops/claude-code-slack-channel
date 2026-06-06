@@ -32,6 +32,7 @@ import {
 } from './lib.ts'
 import {
   buildAgentapiCommand,
+  buildHeartbeatMessage,
   claudeProjectSessionJsonlPath,
   buildSessionKey,
   buildSlackContextPrompt,
@@ -42,7 +43,9 @@ import {
   formatForwardedMessage,
   forwardMessage,
   readRegistry,
+  reapFakeActiveSessions,
   registryFilePath,
+  replyIsStartupArtifact,
   sanitizeAgentReply,
   sessionKeyFromMeta,
   stateFilePathForKey,
@@ -2730,6 +2733,429 @@ describe('thread_router forwardMessage', () => {
     expect(posted.content).toContain(
       '<channel source="slack" chat_id="C123" thread_ts="1800000000.000001" ts="1800000000.000002" message_id="1800000000.000002" user="casey" user_id="U123" attachment_count="2" attachment_paths="/tmp/a.txt; /tmp/b.txt">\nhello\n</channel>',
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 5 (opshub#155) — progress heartbeat sanitizer
+//
+// While the thread worker's agentapi status is `running`, the main router edits
+// the "💭 Thinking…" message in place. buildHeartbeatMessage produces that text:
+// terminal-style "still working", a normalized "N% context used" tail when one
+// is available, and never raw TUI content (no spam).
+// ---------------------------------------------------------------------------
+
+describe('thread_router buildHeartbeatMessage', () => {
+  test('returns terminal-style still-working text when no context usage is known', () => {
+    expect(buildHeartbeatMessage()).toBe('💭 Still working…')
+  })
+
+  test('appends a normalized context-usage tail', () => {
+    expect(buildHeartbeatMessage({ contextUsage: '8% context used' })).toBe(
+      '💭 Still working… · 8% context used',
+    )
+  })
+
+  test('extracts only the context figure from TUI-laden input (no spam)', () => {
+    expect(
+      buildHeartbeatMessage({ contextUsage: '✶ Ruminating… (51s...) ... 16% context used' }),
+    ).toBe('💭 Still working… · 16% context used')
+  })
+
+  test('drops unparseable context usage', () => {
+    expect(buildHeartbeatMessage({ contextUsage: 'garbage with no figure' })).toBe(
+      '💭 Still working…',
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 5 (opshub#155) — proactive fake-active registry cleanup
+//
+// A worker can die (or its agentapi stop listening) while its registry entry
+// still says active/activating, pinning a port that nextFreePort then refuses
+// to reuse. reapFakeActiveSessions marks those entries dead before routing so
+// the port frees up; ensureSession calls it on every route.
+// ---------------------------------------------------------------------------
+
+describe('thread_router reapFakeActiveSessions', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  const now = Date.parse('2026-06-06T12:00:00.000Z')
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-reap-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function entry(port: number, pid: number, status: 'active' | 'activating'): ThreadSessionRegistry[string] {
+    return {
+      session_id: '11111111-1111-5111-8111-111111111111',
+      port,
+      pid,
+      status,
+      created_at: new Date(now - 60_000).toISOString(),
+      last_active_at: new Date(now - 30_000).toISOString(),
+      cwd: tmpRoot,
+    }
+  }
+
+  test('marks active sessions with dead pids as dead and reports them', async () => {
+    const deadKey = buildSessionKey('C_DEAD', '1700000000.000100')
+    const liveKey = buildSessionKey('C_LIVE', '1700000000.000200')
+    await writeRegistry(tmpRoot, {
+      [deadKey]: entry(3010, 2439269, 'active'),
+      [liveKey]: entry(3011, 2455048, 'active'),
+    })
+
+    const reaped = await reapFakeActiveSessions({
+      stateDir: tmpRoot,
+      now: () => now,
+      pidIsAlive: (pid) => pid === 2455048,
+      portIsAvailable: async (port) => port === 3010,
+    })
+
+    expect(reaped).toEqual([deadKey])
+    const reg = await readRegistry(tmpRoot)
+    expect(reg[deadKey]?.status).toBe('dead')
+    expect(reg[deadKey]?.pid).toBe(0)
+    expect(reg[liveKey]?.status).toBe('active')
+    expect(reg[liveKey]?.pid).toBe(2455048)
+  })
+
+  test('reaps an active session whose port is closed even when the pid looks alive', async () => {
+    const ghostKey = buildSessionKey('C_GHOST', '1700000000.000100')
+    await writeRegistry(tmpRoot, { [ghostKey]: entry(3010, 999, 'active') })
+
+    const reaped = await reapFakeActiveSessions({
+      stateDir: tmpRoot,
+      now: () => now,
+      pidIsAlive: () => true,
+      portIsAvailable: async () => true,
+    })
+
+    expect(reaped).toEqual([ghostKey])
+    expect((await readRegistry(tmpRoot))[ghostKey]?.status).toBe('dead')
+  })
+
+  test('leaves activating sessions and healthy active sessions untouched', async () => {
+    const activatingKey = buildSessionKey('C_ACT', '1700000000.000100')
+    const activeKey = buildSessionKey('C_OK', '1700000000.000200')
+    await writeRegistry(tmpRoot, {
+      [activatingKey]: entry(3012, 0, 'activating'),
+      [activeKey]: entry(3011, 5678, 'active'),
+    })
+
+    const reaped = await reapFakeActiveSessions({
+      stateDir: tmpRoot,
+      now: () => now,
+      pidIsAlive: () => true,
+      portIsAvailable: async () => false,
+    })
+
+    expect(reaped).toEqual([])
+    const reg = await readRegistry(tmpRoot)
+    expect(reg[activatingKey]?.status).toBe('activating')
+    expect(reg[activeKey]?.status).toBe('active')
+  })
+
+  test('routing reuses a port freed from a fake-active entry', async () => {
+    const deadKey = buildSessionKey('C_DEAD', '1700000000.000100')
+    await writeRegistry(tmpRoot, { [deadKey]: entry(3010, 1234, 'active') })
+
+    const spawnCalls: Array<{ command: string; args: string[] }> = []
+    const session = await ensureSession('C_NEW', '1700000000.000900', {
+      stateDir: tmpRoot,
+      cwd: tmpRoot,
+      now: () => now,
+      pidIsAlive: () => false,
+      portIsAvailable: async () => true,
+      spawnAgent: (command, args) => {
+        spawnCalls.push({ command, args })
+        return { pid: 7777, unref: () => {} }
+      },
+      fetch: async () =>
+        new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      statusPollMs: 1,
+    })
+
+    expect(session.port).toBe(3010)
+    expect(session.status).toBe('active')
+    expect(spawnCalls).toHaveLength(1)
+    expect((await readRegistry(tmpRoot))[deadKey]?.status).toBe('dead')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 5 (opshub#155) — startup / context-index artifact detection
+//
+// A fresh worker's first /messages snapshot is the Claude startup screen — the
+// Settings Warning box, the "⚠ N setup issues … · /doctor" banner, and the
+// SessionStart hook's context-index ($CMEM) dump — none of which sanitizeAgentReply
+// strips. Posting it would swallow the real reply. Strings below are taken from
+// a real captured worker .state file.
+// ---------------------------------------------------------------------------
+
+describe('thread_router replyIsStartupArtifact', () => {
+  test('flags the Claude settings-warning startup screen', () => {
+    const screen = [
+      '────────────────────────────────────────────────────────────────────────────────',
+      '  Settings Warning',
+      '  /home/sfanix/.claude/settings.json',
+      '   └ permissions',
+      '  ❯ 1. Continue',
+      '    2. Fix with Claude',
+    ].join('\n')
+    expect(replyIsStartupArtifact(screen)).toBe(true)
+  })
+
+  test('flags the SessionStart context-index dump', () => {
+    const dump = [
+      ' ⚠ 2 setup issues: settings, plugins · /doctor',
+      '  ⎿  SessionStart:startup says: [slack-channel] recent context, 2026-06-06',
+      '     Legend: session-request | 🔴 bugfix | 🟣 feature',
+      '     Context Index: This semantic index (titles, types, files) is usually enough',
+    ].join('\n')
+    expect(replyIsStartupArtifact(dump)).toBe(true)
+  })
+
+  test('does not flag a normal reply', () => {
+    expect(
+      replyIsStartupArtifact('Here is the summary you asked for:\n\n1. First point\n2. Second point'),
+    ).toBe(false)
+  })
+
+  test('does not flag a context-usage-only line', () => {
+    expect(replyIsStartupArtifact('8% context used')).toBe(false)
+  })
+
+  test('does not flag a reply that merely mentions /doctor in prose', () => {
+    expect(replyIsStartupArtifact('Run /doctor to check your setup when you get a chance.')).toBe(false)
+  })
+})
+
+describe('thread_router forwardMessage startup-artifact handling', () => {
+  const STARTUP_SCREEN = [
+    '────────────────────────────────────────────────────────────────────────────────',
+    '  Settings Warning',
+    '  /home/sfanix/.claude/settings.json',
+    '  ❯ 1. Continue',
+    '    2. Fix with Claude',
+    ' ⚠ 2 setup issues: settings, plugins · /doctor',
+    '  ⎿  SessionStart:startup says: [slack-channel] recent context',
+    '     Context Index: This semantic index is usually enough',
+  ].join('\n')
+
+  function makeMeta() {
+    return {
+      chat_id: 'C123',
+      thread_ts: '1800000000.000001',
+      ts: '1800000000.000002',
+      message_id: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+    }
+  }
+
+  function startupFetch(jsonlPath: string, jsonlLines: string[], messagesContent: string) {
+    return async (url: string) => {
+      if (url.endsWith('/message')) {
+        writeFileSync(jsonlPath, jsonlLines.join('\n') + (jsonlLines.length ? '\n' : ''))
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [{ id: 2, role: 'agent', content: messagesContent, time: '2026-06-06T00:00:01.000Z' }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+  }
+
+  test('returns the JSONL reply when AgentAPI shows only the startup screen', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-startup-jsonl-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = makeMeta()
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = startupFetch(
+        jsonlPath,
+        [
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }),
+          JSON.stringify({
+            type: 'assistant',
+            message: { model: 'claude-opus-4-6', role: 'assistant', content: [{ type: 'text', text: 'the real answer' }] },
+          }),
+        ],
+        STARTUP_SCREEN,
+      )
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0 },
+        meta,
+      )
+
+      expect(reply).toBe('the real answer')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('never posts the raw startup screen when the JSONL has no reply yet', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-startup-empty-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = makeMeta()
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = startupFetch(
+        jsonlPath,
+        [JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } })],
+        STARTUP_SCREEN,
+      )
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0 },
+        meta,
+      )
+
+      expect(reply).toBe('')
+      expect(replyIsStartupArtifact(reply)).toBe(false)
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('preserves the context-usage line while suppressing the startup screen', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-startup-ctx-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = makeMeta()
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = startupFetch(
+        jsonlPath,
+        [JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } })],
+        `${STARTUP_SCREEN}\n                                      12% context used`,
+      )
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0 },
+        meta,
+      )
+
+      expect(reply).toBe('12% context used')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('thread_router forwardMessage heartbeat', () => {
+  function heartbeatFetch(statuses: string[], messagesContent: string) {
+    return async (url: string) => {
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: statuses.shift() || 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [{ id: 2, role: 'agent', content: messagesContent, time: '2026-06-06T00:00:01.000Z' }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+  }
+
+  test('emits a heartbeat with normalized context usage while the agent is running', async () => {
+    const heartbeats: Array<{ contextUsage?: string }> = []
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: heartbeatFetch(['running', 'stable'], 'the answer\n\n23% context used'),
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      heartbeatMs: 0,
+      onHeartbeat: (info) => {
+        heartbeats.push(info)
+      },
+    })
+
+    expect(reply).toContain('the answer')
+    expect(heartbeats).toEqual([{ contextUsage: '23% context used' }])
+  })
+
+  test('rate-limits heartbeats across consecutive running polls', async () => {
+    const heartbeats: Array<{ contextUsage?: string }> = []
+    await forwardMessage(3099, 'hello', {
+      fetch: heartbeatFetch(['running', 'running', 'stable'], 'still going\n\n5% context used'),
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      heartbeatMs: 100_000,
+      onHeartbeat: (info) => {
+        heartbeats.push(info)
+      },
+    })
+
+    expect(heartbeats).toHaveLength(1)
+  })
+
+  test('does not emit heartbeats when the agent is already stable', async () => {
+    const heartbeats: Array<{ contextUsage?: string }> = []
+    await forwardMessage(3099, 'hello', {
+      fetch: heartbeatFetch(['stable'], 'instant answer'),
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      heartbeatMs: 0,
+      onHeartbeat: (info) => {
+        heartbeats.push(info)
+      },
+    })
+
+    expect(heartbeats).toEqual([])
   })
 })
 
