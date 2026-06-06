@@ -26,6 +26,9 @@ import {
   chmodSync,
   existsSync,
   renameSync,
+  openSync,
+  closeSync,
+  unlinkSync,
 } from 'fs'
 import {
   defaultAccess,
@@ -46,6 +49,7 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
+import { ensureSession, forwardMessage } from './thread_router.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -139,6 +143,61 @@ let selfBotId = ''
 let selfAppId = ''
 
 // ---------------------------------------------------------------------------
+// Single-instance Slack socket guard (opshub#78)
+// ---------------------------------------------------------------------------
+//
+// Only ONE process may hold the Slack Socket Mode connection. With agent-teams
+// enabled, a teammate inherits the main session's cwd (this plugin dir) and
+// auto-starts a second `slack` MCP server from .mcp.json — opening a competing
+// Socket Mode connection that Slack load-balances against, stealing events.
+// This advisory PID lock lets only the first live instance open the socket;
+// later instances run MCP-only (tools still work, no second socket).
+
+const SOCKET_LOCK_FILE = join(STATE_DIR, 'socket.lock')
+let ownsSocketLock = false
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // ESRCH → dead; EPERM → alive but owned by another user (treat as alive)
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function acquireSocketLock(): boolean {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(SOCKET_LOCK_FILE, 'wx') // O_CREAT | O_EXCL — atomic
+      writeFileSync(fd, String(process.pid))
+      closeSync(fd)
+      ownsSocketLock = true
+      return true
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      let holder = 0
+      try {
+        holder = parseInt(readFileSync(SOCKET_LOCK_FILE, 'utf-8').trim(), 10)
+      } catch { /* unreadable — treat as stale */ }
+      if (holder && holder !== process.pid && isPidAlive(holder)) return false
+      // Stale lock (dead/unreadable holder) — clear and retry once.
+      try { unlinkSync(SOCKET_LOCK_FILE) } catch { /* another instance raced us */ }
+    }
+  }
+  return false
+}
+
+function releaseSocketLock(): void {
+  if (!ownsSocketLock) return
+  try {
+    const holder = parseInt(readFileSync(SOCKET_LOCK_FILE, 'utf-8').trim(), 10)
+    if (holder === process.pid) unlinkSync(SOCKET_LOCK_FILE)
+  } catch { /* already gone */ }
+  ownsSocketLock = false
+}
+
+// ---------------------------------------------------------------------------
 // Access control — load / save / prune
 // ---------------------------------------------------------------------------
 
@@ -216,6 +275,51 @@ let lastActiveThread: string | undefined
 
 function assertOutboundAllowed(chatId: string): void {
   libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
+}
+
+async function sendReplyToSlack(args: {
+  chatId: string
+  text: string
+  threadTs?: string
+  files?: string[]
+}): Promise<{ chunks: number; files: number; lastTs: string }> {
+  const { chatId, text, threadTs, files } = args
+
+  assertOutboundAllowed(chatId)
+
+  const access = getAccess()
+  const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
+  const mode = access.chunkMode || 'newline'
+  const chunks = chunkText(text, limit, mode)
+
+  let lastTs = ''
+  for (const chunk of chunks) {
+    const res = await web.chat.postMessage({
+      channel: chatId,
+      text: chunk,
+      thread_ts: threadTs,
+      unfurl_links: false,
+      unfurl_media: false,
+    })
+    lastTs = (res.ts as string) || lastTs
+  }
+
+  // Upload files if provided
+  if (files && files.length > 0) {
+    for (const filePath of files) {
+      assertSendable(filePath)
+      const resolved = resolve(filePath)
+      const uploadArgs: Record<string, any> = {
+        channel_id: chatId,
+        file: resolved,
+        filename: basename(resolved),
+      }
+      if (threadTs) uploadArgs.thread_ts = threadTs
+      await web.filesUploadV2(uploadArgs as any)
+    }
+  }
+
+  return { chunks: chunks.length, files: files?.length || 0, lastTs }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,45 +514,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const threadTs: string | undefined = args.thread_ts
       const files: string[] | undefined = args.files
 
-      assertOutboundAllowed(chatId)
-
-      const access = getAccess()
-      const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
-      const mode = access.chunkMode || 'newline'
-      const chunks = chunkText(text, limit, mode)
-
-      let lastTs = ''
-      for (const chunk of chunks) {
-        const res = await web.chat.postMessage({
-          channel: chatId,
-          text: chunk,
-          thread_ts: threadTs,
-          unfurl_links: false,
-          unfurl_media: false,
-        })
-        lastTs = (res.ts as string) || lastTs
-      }
-
-      // Upload files if provided
-      if (files && files.length > 0) {
-        for (const filePath of files) {
-          assertSendable(filePath)
-          const resolved = resolve(filePath)
-          const uploadArgs: Record<string, any> = {
-            channel_id: chatId,
-            file: resolved,
-            filename: basename(resolved),
-          }
-          if (threadTs) uploadArgs.thread_ts = threadTs
-          await web.filesUploadV2(uploadArgs as any)
-        }
-      }
+      const sent = await sendReplyToSlack({ chatId, text, threadTs, files })
 
       return {
         content: [
           {
             type: 'text',
-            text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+            text: `Sent ${sent.chunks} message(s)${sent.files ? ` + ${sent.files} file(s)` : ''} to ${chatId}${sent.lastTs ? ` [ts: ${sent.lastTs}]` : ''}`,
           },
         ],
       }
@@ -849,6 +921,24 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 // PERMISSION_REPLY_RE imported from lib.ts — shared with gate() for
 // peer-bot permission-reply blocking.
 
+async function deliverToSession(text: string, meta: Record<string, string>): Promise<void> {
+  const chatId = meta.chat_id
+  const threadTs = meta.thread_ts || meta.ts
+  if (!chatId || !threadTs) {
+    throw new Error('deliverToSession requires meta.chat_id and meta.thread_ts or meta.ts')
+  }
+
+  const session = await ensureSession(chatId, threadTs)
+  const replyText = await forwardMessage(session.port, text)
+  if (!replyText.trim()) return
+
+  await sendReplyToSlack({
+    chatId,
+    text: replyText,
+    threadTs,
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Inbound message handler
 // ---------------------------------------------------------------------------
@@ -1019,11 +1109,8 @@ async function handleMessage(event: unknown): Promise<void> {
         thread_ts: thinkingThreadTs,
       }).catch(() => {})
 
-      // Push into Claude Code session via MCP notification
-      mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: text, meta },
-      })
+      // Deliver into the thread-scoped agentapi session.
+      await deliverToSession(text, meta)
     }
   }
 }
@@ -1078,11 +1165,14 @@ async function shutdown(reason: string, code = 0): Promise<void> {
   }, 3000)
   forceExit.unref()
 
-  try {
-    await socket.disconnect()
-  } catch (err) {
-    console.error('[slack] socket.disconnect() failed:', err)
+  if (ownsSocketLock) {
+    try {
+      await socket.disconnect()
+    } catch (err) {
+      console.error('[slack] socket.disconnect() failed:', err)
+    }
   }
+  releaseSocketLock()
   try {
     await mcp.close()
   } catch { /* ignore */ }
@@ -1112,9 +1202,16 @@ async function main(): Promise<void> {
     console.error('[slack] Failed to resolve bot identity:', err)
   }
 
-  // Connect Socket Mode (Slack ↔ local WebSocket)
-  await socket.start()
-  console.error('[slack] Socket Mode connected')
+  // Connect Socket Mode (Slack ↔ local WebSocket) — only as sole owner.
+  // A second instance (e.g. an agent-team teammate that inherited this cwd and
+  // auto-started the MCP server) must NOT open a competing connection, or Slack
+  // splits events across both sockets (opshub#78). Non-owners run MCP-only.
+  if (acquireSocketLock()) {
+    await socket.start()
+    console.error(`[slack] Socket Mode connected (lock owner, pid ${process.pid})`)
+  } else {
+    console.error('[slack] Another instance owns the Slack socket; running MCP-only, no Socket Mode (opshub#78)')
+  }
 
   // Connect MCP stdio (server ↔ Claude Code)
   const transport = new StdioServerTransport()

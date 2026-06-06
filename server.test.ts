@@ -29,6 +29,18 @@ import {
   type SessionKey,
 } from './lib.ts'
 import {
+  buildSessionKey,
+  cleanupIdle,
+  ensureSession,
+  forwardMessage,
+  readRegistry,
+  registryFilePath,
+  sessionKeyFromMeta,
+  writeRegistry,
+  type SpawnAgent,
+  type ThreadSessionRegistry,
+} from './thread_router.ts'
+import {
   mkdtempSync,
   mkdirSync,
   writeFileSync,
@@ -1626,6 +1638,239 @@ describe('session persistence across restart', () => {
 
     expect(loadedOld.ownerId).toBe('U_A')
     expect(loadedNew.ownerId).toBe('U_B')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// thread_router — Phase 2 thread-scoped sticky sessions
+// ---------------------------------------------------------------------------
+
+describe('thread_router registry', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-registry-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('writes registry atomically and reads it back', async () => {
+    const key = buildSessionKey('C_REG', '1700000000.000100')
+    const registry: ThreadSessionRegistry = {
+      [key]: {
+        session_id: '11111111-1111-5111-8111-111111111111',
+        port: 3010,
+        pid: 1234,
+        status: 'active',
+        created_at: '2026-06-06T00:00:00.000Z',
+        last_active_at: '2026-06-06T00:01:00.000Z',
+        cwd: tmpRoot,
+      },
+    }
+
+    await writeRegistry(tmpRoot, registry)
+
+    expect(await readRegistry(tmpRoot)).toEqual(registry)
+    expect(statSync(registryFilePath(tmpRoot)).mode & 0o777).toBe(0o600)
+    expect(readdirSync(tmpRoot).filter((name) => name.includes('.tmp.'))).toEqual([])
+  })
+})
+
+describe('thread_router session keys', () => {
+  test('uses channel:thread_ts for threaded messages', () => {
+    expect(
+      sessionKeyFromMeta({
+        chat_id: 'C_THREAD',
+        ts: '1700000000.000100',
+        thread_ts: '1699999999.999999',
+      }),
+    ).toBe('C_THREAD:1699999999.999999')
+  })
+
+  test('uses channel:ts for top-level messages', () => {
+    expect(
+      sessionKeyFromMeta({
+        chat_id: 'C_TOP',
+        ts: '1700000000.000100',
+      }),
+    ).toBe('C_TOP:1700000000.000100')
+  })
+})
+
+describe('thread_router ensureSession', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-ensure-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('single-flights concurrent activation for the same key', async () => {
+    const spawnCalls: Array<{ command: string; args: string[] }> = []
+    const spawnAgent: SpawnAgent = (command, args) => {
+      spawnCalls.push({ command, args })
+      return { pid: 4321, unref: () => {} }
+    }
+    const fetchOk = async () =>
+      new Response(JSON.stringify({ status: 'stable' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+
+    const [first, second] = await Promise.all([
+      ensureSession('C_SINGLE', '1700000000.000100', {
+        stateDir: tmpRoot,
+        cwd: tmpRoot,
+        spawnAgent,
+        fetch: fetchOk,
+        portIsAvailable: async () => true,
+        statusPollMs: 1,
+      }),
+      ensureSession('C_SINGLE', '1700000000.000100', {
+        stateDir: tmpRoot,
+        cwd: tmpRoot,
+        spawnAgent,
+        fetch: fetchOk,
+        portIsAvailable: async () => true,
+        statusPollMs: 1,
+      }),
+    ])
+
+    expect(first).toEqual(second)
+    expect(first.status).toBe('active')
+    expect(first.port).toBe(3010)
+    expect(first.pid).toBe(4321)
+    expect(spawnCalls).toHaveLength(1)
+    expect(spawnCalls[0]!.args).toContain('--allowedTools')
+    expect(spawnCalls[0]!.args).toContain('Read Edit Write Bash')
+    expect(spawnCalls[0]!.args).not.toContain('--dangerously-skip-permissions')
+
+    const registry = await readRegistry(tmpRoot)
+    expect(registry['C_SINGLE:1700000000.000100']?.status).toBe('active')
+  })
+})
+
+describe('thread_router cleanupIdle', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-cleanup-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('archives stale active sessions and leaves fresh sessions alone', async () => {
+    const now = Date.parse('2026-06-06T12:00:00.000Z')
+    const staleKey = buildSessionKey('C_IDLE', '1700000000.000100')
+    const freshKey = buildSessionKey('C_IDLE', '1700000000.000200')
+    const registry: ThreadSessionRegistry = {
+      [staleKey]: {
+        session_id: '11111111-1111-5111-8111-111111111111',
+        port: 3010,
+        pid: 1234,
+        status: 'active',
+        created_at: new Date(now - 6 * 60 * 60 * 1000).toISOString(),
+        last_active_at: new Date(now - 5 * 60 * 60 * 1000).toISOString(),
+        cwd: tmpRoot,
+      },
+      [freshKey]: {
+        session_id: '22222222-2222-5222-8222-222222222222',
+        port: 3011,
+        pid: 5678,
+        status: 'active',
+        created_at: new Date(now - 10 * 60 * 1000).toISOString(),
+        last_active_at: new Date(now - 1 * 60 * 1000).toISOString(),
+        cwd: tmpRoot,
+      },
+    }
+    const killed: number[] = []
+
+    await writeRegistry(tmpRoot, registry)
+    const stale = await cleanupIdle(4 * 60 * 60 * 1000, {
+      stateDir: tmpRoot,
+      now: () => now,
+      killProcess: (pid) => { killed.push(pid) },
+    })
+
+    const updated = await readRegistry(tmpRoot)
+    expect(stale).toEqual([staleKey])
+    expect(killed).toEqual([1234])
+    expect(updated[staleKey]?.status).toBe('archived')
+    expect(updated[staleKey]?.pid).toBe(0)
+    expect(updated[freshKey]?.status).toBe('active')
+    expect(updated[freshKey]?.pid).toBe(5678)
+  })
+})
+
+describe('thread_router forwardMessage', () => {
+  test('posts user message, polls status, and returns last agent message', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const statuses = ['running', 'stable']
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      calls.push({ url, init })
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: statuses.shift() || 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                id: 1,
+                role: 'user',
+                content: 'hello',
+                time: '2026-06-06T00:00:00.000Z',
+              },
+              {
+                id: 2,
+                role: 'agent',
+                content: 'hello from agent',
+                time: '2026-06-06T00:00:01.000Z',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+    })
+
+    expect(reply).toBe('hello from agent')
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      '/message',
+      '/status',
+      '/status',
+      '/messages',
+    ])
+    expect(calls[0]!.init?.method).toBe('POST')
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      content: 'hello',
+      type: 'user',
+    })
   })
 })
 
