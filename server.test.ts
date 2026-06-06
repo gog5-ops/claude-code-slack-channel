@@ -29,9 +29,12 @@ import {
   type SessionKey,
 } from './lib.ts'
 import {
+  buildAgentapiCommand,
+  claudeProjectSessionJsonlPath,
   buildSessionKey,
   buildSlackContextPrompt,
   claimSlackContextForSession,
+  claudeSessionIdForKey,
   cleanupIdle,
   ensureSession,
   formatForwardedMessage,
@@ -40,6 +43,7 @@ import {
   registryFilePath,
   sanitizeAgentReply,
   sessionKeyFromMeta,
+  stateFilePathForKey,
   writeRegistry,
   type SpawnAgent,
   type ThreadSessionRegistry,
@@ -58,7 +62,7 @@ import {
   readdirSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { join, sep } from 'path'
+import { dirname, join, sep } from 'path'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1763,6 +1767,70 @@ describe('thread_router session keys', () => {
   })
 })
 
+describe('thread_router agentapi command', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let claudeProjectsDir: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-command-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    claudeProjectsDir = join(tmpRoot, 'claude-projects')
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('uses --session-id for first Claude session creation', () => {
+    const key = buildSessionKey('C_CMD', '1700000000.000100')
+    const { args, claudeSessionId } = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+    })
+
+    expect(args).toContain('--session-id')
+    expect(args).toContain(claudeSessionId)
+    expect(args).not.toContain('--resume')
+  })
+
+  test('uses --resume when the deterministic Claude JSONL already exists', () => {
+    const key = buildSessionKey('C_CMD', '1700000000.000200')
+    const sessionId = claudeSessionIdForKey(key)
+    const jsonlPath = claudeProjectSessionJsonlPath(tmpRoot, sessionId, claudeProjectsDir)
+    mkdirSync(dirname(jsonlPath), { recursive: true })
+    writeFileSync(jsonlPath, '')
+
+    const { args, claudeSessionId } = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+    })
+
+    expect(claudeSessionId).toBe(sessionId)
+    expect(args).toContain('--resume')
+    expect(args).toContain(sessionId)
+    expect(args).not.toContain('--session-id')
+  })
+
+  test('allows tests to inject Claude JSONL existence', () => {
+    const key = buildSessionKey('C_CMD', '1700000000.000300')
+    const checkedPaths: string[] = []
+    const { args, claudeSessionId } = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+      sessionJsonlExists: (path) => {
+        checkedPaths.push(path)
+        return true
+      },
+    })
+
+    expect(args).toContain('--resume')
+    expect(args).toContain(claudeSessionId)
+    expect(checkedPaths).toEqual([
+      claudeProjectSessionJsonlPath(tmpRoot, claudeSessionId, claudeProjectsDir),
+    ])
+  })
+})
+
 describe('thread_router ensureSession', () => {
   let rawRoot: string
   let tmpRoot: string
@@ -1817,6 +1885,57 @@ describe('thread_router ensureSession', () => {
 
     const registry = await readRegistry(tmpRoot)
     expect(registry['C_SINGLE:1700000000.000100']?.status).toBe('active')
+  })
+
+  test('restarts active sessions with dead pids and clears fatal startup state', async () => {
+    const key = buildSessionKey('C_STALE', '1700000000.000100')
+    const now = Date.parse('2026-06-06T12:00:00.000Z')
+    await writeRegistry(tmpRoot, {
+      [key]: {
+        session_id: claudeSessionIdForKey(key),
+        port: 3010,
+        pid: 1234,
+        status: 'active',
+        created_at: new Date(now - 60_000).toISOString(),
+        last_active_at: new Date(now - 30_000).toISOString(),
+        cwd: tmpRoot,
+      },
+    })
+    mkdirSync(dirname(stateFilePathForKey(tmpRoot, key)), { recursive: true })
+    writeFileSync(stateFilePathForKey(tmpRoot, key), JSON.stringify({
+      version: 1,
+      messages: [{
+        id: 0,
+        message: `Error: Session ID ${claudeSessionIdForKey(key)} is already in use.`,
+        role: 'agent',
+        time: new Date(now).toISOString(),
+      }],
+      initial_prompt: '',
+      initial_prompt_sent: false,
+    }))
+
+    const spawnCalls: Array<{ command: string; args: string[] }> = []
+    const session = await ensureSession('C_STALE', '1700000000.000100', {
+      stateDir: tmpRoot,
+      cwd: tmpRoot,
+      now: () => now,
+      fetch: async () => new Response(JSON.stringify({ status: 'stable' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+      pidIsAlive: () => false,
+      portIsAvailable: async () => true,
+      spawnAgent: (command, args) => {
+        spawnCalls.push({ command, args })
+        return { pid: 5678, unref: () => {} }
+      },
+      statusPollMs: 1,
+    })
+
+    expect(session.status).toBe('active')
+    expect(session.pid).toBe(5678)
+    expect(spawnCalls).toHaveLength(1)
+    expect(existsSync(stateFilePathForKey(tmpRoot, key))).toBe(false)
   })
 })
 

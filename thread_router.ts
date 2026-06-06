@@ -3,7 +3,7 @@ import { createHash } from 'crypto'
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { dirname, join, resolve } from 'path'
 import { createServer } from 'net'
 
 export type ThreadSessionStatus = 'activating' | 'active' | 'archived' | 'dead'
@@ -32,6 +32,12 @@ export type SpawnAgent = (
   options: { cwd: string; detached: true; stdio: 'ignore' },
 ) => SpawnedProcess
 
+export interface BuildAgentapiCommandOptions {
+  cwd?: string
+  claudeProjectsDir?: string
+  sessionJsonlExists?: (path: string) => boolean
+}
+
 export interface ThreadRouterOptions {
   stateDir?: string
   agentapiPath?: string
@@ -42,6 +48,7 @@ export interface ThreadRouterOptions {
   fetch?: (input: string, init?: RequestInit) => Promise<Response>
   spawnAgent?: SpawnAgent
   portIsAvailable?: (port: number) => Promise<boolean>
+  pidIsAlive?: (pid: number) => boolean
   killProcess?: (pid: number) => void | Promise<void>
   lockTimeoutMs?: number
   lockPollMs?: number
@@ -85,6 +92,8 @@ const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
 const CONTEXT_USAGE_RE = /^(\d+%)\s+context used$/i
 const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?))/
 const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
+const CLAUDE_PROJECT_SAFE_CHAR_RE = /[^A-Za-z0-9_-]/g
+const CLAUDE_SESSION_ALREADY_IN_USE_RE = /Error:\s+Session ID [0-9a-f-]+ is already in use\./i
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -133,18 +142,38 @@ export function claudeSessionIdForKey(key: string): string {
   ].join('-')
 }
 
+export function claudeProjectSessionJsonlPath(
+  cwd: string,
+  sessionId: string,
+  claudeProjectsDir = join(homedir(), '.claude', 'projects'),
+): string {
+  const projectName = resolve(cwd).replace(CLAUDE_PROJECT_SAFE_CHAR_RE, '-')
+  return join(claudeProjectsDir, projectName, `${sessionId}.jsonl`)
+}
+
 export function buildAgentapiCommand(
   port: number,
   key: string,
   stateDir = defaultStateDir(),
   agentapiPath = join(homedir(), 'bin', 'agentapi'),
+  options: BuildAgentapiCommandOptions = {},
 ): { command: string; args: string[]; stateFile: string; claudeSessionId: string } {
   const stateFile = stateFilePathForKey(stateDir, key)
   const claudeSessionId = claudeSessionIdForKey(key)
+  const sessionJsonl = claudeProjectSessionJsonlPath(
+    options.cwd || process.cwd(),
+    claudeSessionId,
+    options.claudeProjectsDir,
+  )
+  const sessionJsonlExists = options.sessionJsonlExists || existsSync
+  const sessionArgs = sessionJsonlExists(sessionJsonl)
+    ? ['--resume', claudeSessionId]
+    : ['--session-id', claudeSessionId]
 
   // agentapi v0.12.2 rejects server-level --session-id. Claude accepts only
   // UUID session IDs, so the thread key is carried by the state file/name and
-  // a deterministic UUID is used for Claude's session identity.
+  // a deterministic UUID is used for Claude's session identity. Once Claude has
+  // created the JSONL for that UUID, later starts must resume it instead.
   return {
     command: agentapiPath,
     args: [
@@ -155,8 +184,7 @@ export function buildAgentapiCommand(
       '--state-file',
       stateFile,
       '--',
-      '--session-id',
-      claudeSessionId,
+      ...sessionArgs,
       '--name',
       key,
       '--model',
@@ -463,7 +491,7 @@ async function ensureSessionUnshared(
 ): Promise<ThreadSession> {
   const existing = await readRegistry(stateDir).then((registry) => registry[key])
   if (existing?.status === 'active') {
-    if (await isAgentHealthy(existing.port, options)) {
+    if (await isThreadSessionHealthy(key, existing, options, stateDir)) {
       return touchSession(key, existing, options, stateDir)
     }
     await markDeadIfCurrent(key, existing, options, stateDir)
@@ -482,7 +510,11 @@ async function activateSession(
 ): Promise<ThreadSession> {
   const claim = await claimActivation(key, options, stateDir)
   if (claim.status === 'active') {
-    return touchSession(key, claim, options, stateDir)
+    if (await isThreadSessionHealthy(key, claim, options, stateDir)) {
+      return touchSession(key, claim, options, stateDir)
+    }
+    await markDeadIfCurrent(key, claim, options, stateDir)
+    return activateSession(key, options, stateDir)
   }
   if (claim.status !== 'activating') {
     return waitForActivation(key, options, stateDir)
@@ -490,15 +522,16 @@ async function activateSession(
 
   const cwd = options.cwd || process.cwd()
   const agentapiPath = options.agentapiPath || join(homedir(), 'bin', 'agentapi')
-  const { command, args } = buildAgentapiCommand(claim.port, key, stateDir, agentapiPath)
+  const { command, args } = buildAgentapiCommand(claim.port, key, stateDir, agentapiPath, { cwd })
   const spawnAgent = options.spawnAgent || defaultSpawnAgent
 
   try {
     await mkdir(join(stateDir, 'sessions'), { recursive: true, mode: 0o700 })
+    await unlinkFatalStartupStateFile(stateDir, key)
     const child = spawnAgent(command, args, { cwd, detached: true, stdio: 'ignore' })
     child.unref?.()
     const pid = child.pid || 0
-    await waitForAgentHealthy(claim.port, options)
+    await waitForAgentHealthy(claim.port, options, key, stateDir)
     return markActive(key, claim, pid, options, stateDir)
   } catch (err) {
     await markDeadIfCurrent(key, claim, options, stateDir)
@@ -613,8 +646,12 @@ async function waitForActivation(
     if (!session || session.status === 'dead' || session.status === 'archived') {
       return activateSession(key, options, stateDir)
     }
-    if (session.status === 'active' && await isAgentHealthy(session.port, options)) {
-      return touchSession(key, session, options, stateDir)
+    if (session.status === 'active') {
+      if (await isThreadSessionHealthy(key, session, options, stateDir)) {
+        return touchSession(key, session, options, stateDir)
+      }
+      await markDeadIfCurrent(key, session, options, stateDir)
+      return activateSession(key, options, stateDir)
     }
     await sleep(pollMs)
   }
@@ -625,12 +662,17 @@ async function waitForActivation(
 async function waitForAgentHealthy(
   port: number,
   options: ThreadRouterOptions,
+  key?: string,
+  stateDir?: string,
 ): Promise<void> {
   const deadline = Date.now() + (options.activationTimeoutMs || DEFAULT_ACTIVATION_TIMEOUT_MS)
   const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
 
   while (Date.now() <= deadline) {
-    if (await isAgentHealthy(port, options)) return
+    if (
+      await isAgentHealthy(port, options) &&
+      (!key || !stateDir || !await hasFatalStartupStateFile(stateDir, key))
+    ) return
     await sleep(pollMs)
   }
 
@@ -674,6 +716,56 @@ async function isAgentHealthy(
     return true
   } catch {
     return false
+  }
+}
+
+async function isThreadSessionHealthy(
+  key: string,
+  session: ThreadSession,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<boolean> {
+  if (session.pid > 0 && !isPidAlive(session.pid, options)) return false
+  if (await hasFatalStartupStateFile(stateDir, key)) return false
+  return isAgentHealthy(session.port, options)
+}
+
+function isPidAlive(pid: number, options: ThreadRouterOptions): boolean {
+  return (options.pidIsAlive || defaultPidIsAlive)(pid)
+}
+
+async function hasFatalStartupStateFile(stateDir: string, key: string): Promise<boolean> {
+  const path = stateFilePathForKey(stateDir, key)
+  try {
+    const raw = await readFile(path, 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return false
+    const messages = (parsed as { messages?: unknown }).messages
+    if (!Array.isArray(messages) || messages.length === 0) return false
+    const hasUserMessage = messages.some((message) =>
+      Boolean(message && typeof message === 'object' && (message as { role?: unknown }).role === 'user'),
+    )
+    if (hasUserMessage) return false
+    return messages.some((message) =>
+      Boolean(
+        message &&
+        typeof message === 'object' &&
+        (message as { role?: unknown }).role === 'agent' &&
+        typeof (message as { message?: unknown }).message === 'string' &&
+        CLAUDE_SESSION_ALREADY_IN_USE_RE.test((message as { message: string }).message),
+      ),
+    )
+  } catch {
+    return false
+  }
+}
+
+async function unlinkFatalStartupStateFile(stateDir: string, key: string): Promise<void> {
+  if (!await hasFatalStartupStateFile(stateDir, key)) return
+  try {
+    await unlink(stateFilePathForKey(stateDir, key))
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
   }
 }
 
@@ -783,6 +875,18 @@ function defaultKillProcess(pid: number): void {
     process.kill(pid, 'TERM')
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err
+  }
+}
+
+function defaultPidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return false
+    if (code === 'EPERM') return true
+    return false
   }
 }
 
