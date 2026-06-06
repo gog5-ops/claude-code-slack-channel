@@ -40,6 +40,7 @@ import {
   assertOutboundAllowed as libAssertOutboundAllowed,
   isSlackFileUrl,
   chunkText,
+  planReplyDelivery,
   sanitizeFilename,
   sanitizeDisplayName,
   gate as libGate,
@@ -326,33 +327,52 @@ async function sendReplyToSlack(args: {
   text: string
   threadTs?: string
   files?: string[]
+  editTs?: string
 }): Promise<{ chunks: number; files: number; lastTs: string }> {
-  const { chatId, text: rawText, threadTs, files } = args
+  const { chatId, text: rawText, threadTs, files, editTs } = args
 
   assertOutboundAllowed(chatId)
 
   const text = rawText.trim().replace(/\n{3,}/g, '\n\n')
-  if (!text) return { chunks: 0, files: 0, lastTs: '' }
-
   const access = getAccess()
   const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
   const mode = access.chunkMode || 'newline'
-  const chunks = chunkText(text, limit, mode)
+  const chunks = text ? chunkText(text, limit, mode) : []
 
+  // Finalize via the progress placeholder when we own one (editTs): the first
+  // chunk updates it in place so "Working…" becomes the answer, the rest post
+  // as new in-thread messages, and an empty reply repurposes it as a terminal
+  // notice so the user is never stranded on a stale "Working…" (opshub#155 P5).
+  const ops = planReplyDelivery(chunks, editTs)
   let lastTs = ''
-  for (const chunk of chunks) {
+  const postChunk = async (body: string) => {
     const res = await web.chat.postMessage({
       channel: chatId,
-      text: chunk,
+      text: body,
       thread_ts: threadTs,
       unfurl_links: false,
       unfurl_media: false,
     })
     lastTs = (res.ts as string) || lastTs
   }
+  for (const op of ops) {
+    if (op.kind === 'update') {
+      try {
+        const res = await web.chat.update({ channel: chatId, ts: op.ts, text: op.text })
+        lastTs = (res.ts as string) || op.ts
+      } catch {
+        // The placeholder may be gone (e.g. the user deleted it). Real reply
+        // content must never be dropped, so fall back to a fresh in-thread
+        // message; the empty-reply notice is cosmetic, so failing it is fine.
+        if (text) await postChunk(op.text)
+      }
+    } else {
+      await postChunk(op.text)
+    }
+  }
 
-  // Upload files if provided
-  if (files && files.length > 0) {
+  // Upload files if provided (as before, only alongside non-empty reply text).
+  if (text && files && files.length > 0) {
     for (const filePath of files) {
       assertSendable(filePath)
       const resolved = resolve(filePath)
@@ -366,7 +386,7 @@ async function sendReplyToSlack(args: {
     }
   }
 
-  return { chunks: chunks.length, files: files?.length || 0, lastTs }
+  return { chunks: chunks.length, files: text && files ? files.length : 0, lastTs }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,12 +1041,15 @@ async function deliverToSession(
     { includeSlackContext, onHeartbeat },
     meta,
   )
-  if (!replyText.trim()) return
 
+  // Finalize the progress placeholder in place instead of posting a separate
+  // message and leaving "Working…" stranded. An empty reply turns the
+  // placeholder into a terminal notice (opshub#155, Phase 5 follow-up).
   await sendReplyToSlack({
     chatId,
     text: replyText,
     threadTs,
+    editTs: progressTs,
   })
 }
 

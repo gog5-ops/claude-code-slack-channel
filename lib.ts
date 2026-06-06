@@ -747,6 +747,36 @@ export function chunkText(text: string, limit: number, mode: 'length' | 'newline
 }
 
 // ---------------------------------------------------------------------------
+// Reply delivery planning
+// ---------------------------------------------------------------------------
+
+// Shown in place of a stranded "Working…" progress placeholder when a turn
+// finishes with no reply text to send (opshub#155, Phase 5 follow-up).
+export const EMPTY_REPLY_NOTICE = '(no reply)'
+
+// A single Slack write the main router makes to deliver a finalized reply:
+// either update an existing message (the progress placeholder) or post a new
+// in-thread message.
+export type SlackDeliveryOp =
+  | { kind: 'update'; ts: string; text: string }
+  | { kind: 'post'; text: string }
+
+// Decide the Slack writes that finalize a reply. The first chunk reuses the
+// progress placeholder (`editTs`) via an in-place update so "Working…" becomes
+// the answer; remaining chunks post as new in-thread messages. An empty reply
+// repurposes the placeholder as a terminal notice so the user is never left on a
+// stale "Working…"; with no placeholder and no content there is nothing to do.
+export function planReplyDelivery(chunks: string[], editTs?: string): SlackDeliveryOp[] {
+  const nonEmpty = chunks.filter((chunk) => chunk.trim().length > 0)
+  if (nonEmpty.length === 0) {
+    return editTs ? [{ kind: 'update', ts: editTs, text: EMPTY_REPLY_NOTICE }] : []
+  }
+  return nonEmpty.map((text, index) =>
+    index === 0 && editTs ? { kind: 'update', ts: editTs, text } : { kind: 'post', text },
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Attachment sanitization
 // ---------------------------------------------------------------------------
 

@@ -25,6 +25,8 @@ import {
   PAIRING_EXPIRY_MS,
   isSlackMcpOutboundToolName,
   slackMcpToolNamesForMode,
+  planReplyDelivery,
+  EMPTY_REPLY_NOTICE,
   type Access,
   type GateOptions,
   type Session,
@@ -866,6 +868,54 @@ describe('chunkText', () => {
     const text = 'short\nshort\nshort'
     const result = chunkText(text, 100, 'newline')
     expect(result).toEqual(['short\nshort\nshort'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// planReplyDelivery() — finalize a reply by reusing the progress placeholder
+// (opshub#155, Phase 5 follow-up). The first chunk updates the "Working…"
+// placeholder in place; the rest post as new in-thread messages. An empty reply
+// repurposes the placeholder as a terminal notice so the user is never stranded
+// on a stale "Working…".
+// ---------------------------------------------------------------------------
+
+describe('planReplyDelivery', () => {
+  test('finalizes a single-chunk reply by updating the progress placeholder in place', () => {
+    expect(planReplyDelivery(['the answer'], 'TS_PROGRESS')).toEqual([
+      { kind: 'update', ts: 'TS_PROGRESS', text: 'the answer' },
+    ])
+  })
+
+  test('updates the placeholder with the first chunk and posts the rest in-thread', () => {
+    expect(planReplyDelivery(['chunk1', 'chunk2', 'chunk3'], 'TS_PROGRESS')).toEqual([
+      { kind: 'update', ts: 'TS_PROGRESS', text: 'chunk1' },
+      { kind: 'post', text: 'chunk2' },
+      { kind: 'post', text: 'chunk3' },
+    ])
+  })
+
+  test('posts every chunk as a new message when there is no placeholder to reuse', () => {
+    expect(planReplyDelivery(['chunk1', 'chunk2'], undefined)).toEqual([
+      { kind: 'post', text: 'chunk1' },
+      { kind: 'post', text: 'chunk2' },
+    ])
+  })
+
+  test('marks the placeholder terminal with a notice when the reply is empty', () => {
+    expect(planReplyDelivery([], 'TS_PROGRESS')).toEqual([
+      { kind: 'update', ts: 'TS_PROGRESS', text: EMPTY_REPLY_NOTICE },
+    ])
+  })
+
+  test('treats whitespace-only chunks as empty', () => {
+    expect(planReplyDelivery(['   '], 'TS_PROGRESS')).toEqual([
+      { kind: 'update', ts: 'TS_PROGRESS', text: EMPTY_REPLY_NOTICE },
+    ])
+    expect(planReplyDelivery(['   '], undefined)).toEqual([])
+  })
+
+  test('does nothing for an empty reply when there is no placeholder', () => {
+    expect(planReplyDelivery([], undefined)).toEqual([])
   })
 })
 
