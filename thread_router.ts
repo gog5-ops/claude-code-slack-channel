@@ -226,14 +226,16 @@ export async function forwardMessage(
   port: number,
   text: string,
   options: ThreadRouterOptions = {},
+  meta?: Record<string, string>,
 ): Promise<string> {
   const fetchImpl = options.fetch || fetch
   const baseUrl = `http://127.0.0.1:${port}`
+  const content = meta ? formatForwardedMessage(text, meta) : text
 
   await fetchJson<{ ok?: boolean }>(fetchImpl, `${baseUrl}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content: text, type: 'user' }),
+    body: JSON.stringify({ content, type: 'user' }),
   })
 
   await waitForStable(port, options)
@@ -243,6 +245,22 @@ export async function forwardMessage(
     (message) => message.role === 'agent' && typeof message.content === 'string',
   )
   return agentMessages.at(-1)?.content || ''
+}
+
+function escapeAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+export function formatForwardedMessage(text: string, meta: Record<string, string>): string {
+  const attrs = Object.entries(meta)
+    .filter(([, value]) => value !== '')
+    .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
+    .join(' ')
+  return `<channel source="slack" ${attrs}>\n${text}\n</channel>`
 }
 
 export async function cleanupIdle(

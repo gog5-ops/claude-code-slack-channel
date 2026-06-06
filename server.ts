@@ -283,9 +283,12 @@ async function sendReplyToSlack(args: {
   threadTs?: string
   files?: string[]
 }): Promise<{ chunks: number; files: number; lastTs: string }> {
-  const { chatId, text, threadTs, files } = args
+  const { chatId, text: rawText, threadTs, files } = args
 
   assertOutboundAllowed(chatId)
+
+  const text = rawText.trim().replace(/\n{3,}/g, '\n\n')
+  if (!text) return { chunks: 0, files: 0, lastTs: '' }
 
   const access = getAccess()
   const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
@@ -929,7 +932,7 @@ async function deliverToSession(text: string, meta: Record<string, string>): Pro
   }
 
   const session = await ensureSession(chatId, threadTs)
-  const replyText = await forwardMessage(session.port, text)
+  const replyText = await forwardMessage(session.port, text, {}, meta)
   if (!replyText.trim()) return
 
   await sendReplyToSlack({
@@ -937,6 +940,26 @@ async function deliverToSession(text: string, meta: Record<string, string>): Pro
     text: replyText,
     threadTs,
   })
+}
+
+async function downloadSlackFiles(messageTs: string, files: any[]): Promise<string[]> {
+  const paths: string[] = []
+  for (const file of files) {
+    const url = file.url_private_download || file.url_private
+    if (!url || !isSlackFileUrl(url)) continue
+
+    const safeName = sanitizeFilename(file.name || `file_${Date.now()}`)
+    const outPath = join(INBOX_DIR, `${messageTs.replace('.', '_')}_${safeName}`)
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${botToken}` },
+    })
+    if (!resp.ok) continue
+
+    const buffer = Buffer.from(await resp.arrayBuffer())
+    writeFileSync(outPath, buffer)
+    paths.push(outPath)
+  }
+  return paths
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1116,8 @@ async function handleMessage(event: unknown): Promise<void> {
         })
         meta.attachment_count = String(evFiles.length)
         meta.attachments = fileDescs.join('; ')
+        const paths = await downloadSlackFiles(ev['ts'] as string, evFiles)
+        if (paths.length) meta.attachment_paths = paths.join('; ')
       }
 
       // Strip bot mention from text if present
