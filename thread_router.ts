@@ -98,9 +98,11 @@ const TUI_PREFIX_RE = /^[ \t]*[●⏺]\s*/
 const TUI_TIMED_STATUS_RE =
   /^[✻✶✱✢]\s+.*\bfor\s+\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b/i
 const TUI_TOOL_STATUS_RE = /^(?:Ran|Searched|Called)\b(?:\s|:|$)/
+const TUI_TRANSIENT_STATUS_RE = /^[✻✶✱✢]?\s*(?:Ruminating|Thinking)(?:…|\.\.\.)(?:\s|$|\()/i
 const SLACK_INBOUND_ECHO_RE = /^←\s*slack\s*·\s*/i
 const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
 const CONTEXT_USAGE_RE = /^(\d+%)\s+context used$/i
+const CONTEXT_USAGE_ANYWHERE_RE = /(\d+%)\s+context used/gi
 const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?))/
 const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 const CLAUDE_PROJECT_SAFE_CHAR_RE = /[^A-Za-z0-9_-]/g
@@ -304,13 +306,15 @@ export async function forwardMessage(
 
   const content = await waitForSettledAgentMessageContent(port, options)
   const sanitized = sanitizeAgentReply(content)
+  const contextUsageLine = latestContextUsageLine(content)
   if (!replyNeedsJsonlFallback(sanitized)) return sanitized
 
   const jsonlContent = jsonlFallbackState
     ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
     : undefined
   const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
-  return sanitizedJsonl || sanitized
+  if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
+  return sanitized
 }
 
 async function captureClaudeJsonlFallbackState(
@@ -346,6 +350,23 @@ function replyNeedsJsonlFallback(reply: string): boolean {
   const trimmed = reply.trim()
   if (!trimmed) return true
   return trimmed.split('\n').every((line) => CONTEXT_USAGE_RE.test(line.trim()))
+}
+
+function latestContextUsageLine(content: string): string | undefined {
+  let latest: string | undefined
+  CONTEXT_USAGE_ANYWHERE_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = CONTEXT_USAGE_ANYWHERE_RE.exec(content)) !== null) {
+    latest = `${match[1]} context used`
+  }
+  return latest
+}
+
+function appendContextUsageLine(reply: string, contextUsageLine: string | undefined): string {
+  const trimmed = reply.trim()
+  if (!contextUsageLine || !trimmed) return trimmed
+  if (trimmed.split('\n').some((line) => line.trim() === contextUsageLine)) return trimmed
+  return `${trimmed}\n\n${contextUsageLine}`
 }
 
 async function fetchLatestClaudeJsonlAssistantText(
@@ -499,7 +520,8 @@ export function sanitizeAgentReply(content: string): string {
     if (
       trimmed &&
       (TUI_TIMED_STATUS_RE.test(trimmed) ||
-        TUI_TOOL_STATUS_RE.test(trimmed))
+        TUI_TOOL_STATUS_RE.test(trimmed) ||
+        TUI_TRANSIENT_STATUS_RE.test(trimmed))
     ) {
       continue
     }

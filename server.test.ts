@@ -2184,6 +2184,17 @@ describe('thread_router forwardMessage', () => {
     ).toBe('11% context used')
   })
 
+  test('sanitizeAgentReply drops transient rumination and thinking status lines', () => {
+    expect(
+      sanitizeAgentReply(
+        [
+          '✶ Ruminating… (51s...) ... 16% context used',
+          '● Thinking... (2s...)',
+        ].join('\n'),
+      ),
+    ).toBe('')
+  })
+
   test('sanitizeAgentReply strips live Slack echo while preserving context usage lines', () => {
     expect(
       sanitizeAgentReply(
@@ -2425,7 +2436,7 @@ describe('thread_router forwardMessage', () => {
                 {
                   id: 2,
                   role: 'agent',
-                  content: '                                                               16% context used',
+                  content: '✶ Ruminating… (51s...) ... 16% context used',
                   time: '2026-06-06T00:00:01.000Z',
                 },
               ],
@@ -2450,7 +2461,7 @@ describe('thread_router forwardMessage', () => {
         meta,
       )
 
-      expect(reply).toBe('real assistant text from jsonl')
+      expect(reply).toBe('real assistant text from jsonl\n\n16% context used')
     } finally {
       rmSync(rawRoot, { recursive: true, force: true })
     }
