@@ -23,6 +23,8 @@ import {
   MAX_PENDING,
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
+  isSlackMcpOutboundToolName,
+  slackMcpToolNamesForMode,
   type Access,
   type GateOptions,
   type Session,
@@ -745,6 +747,37 @@ describe('isSlackFileUrl', () => {
 
   test('rejects file:// URLs', () => {
     expect(isSlackFileUrl('file:///etc/passwd')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Slack MCP tool exposure policy
+// ---------------------------------------------------------------------------
+
+describe('Slack MCP tool exposure policy', () => {
+  test('identifies outbound Slack MCP tool names', () => {
+    expect(isSlackMcpOutboundToolName('reply')).toBe(true)
+    expect(isSlackMcpOutboundToolName('react')).toBe(true)
+    expect(isSlackMcpOutboundToolName('edit_message')).toBe(true)
+    expect(isSlackMcpOutboundToolName('fetch_messages')).toBe(false)
+    expect(isSlackMcpOutboundToolName('download_attachment')).toBe(false)
+  })
+
+  test('read-only mode hides outbound tools but keeps read/download tools', () => {
+    expect(slackMcpToolNamesForMode(false)).toEqual([
+      'fetch_messages',
+      'download_attachment',
+    ])
+  })
+
+  test('send-capable mode exposes outbound and read/download tools', () => {
+    expect(slackMcpToolNamesForMode(true)).toEqual([
+      'reply',
+      'react',
+      'edit_message',
+      'fetch_messages',
+      'download_attachment',
+    ])
   })
 })
 

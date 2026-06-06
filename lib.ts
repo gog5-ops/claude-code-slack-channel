@@ -959,3 +959,29 @@ export function isDuplicateEvent(
   seen.set(key, now + ttlMs)
   return false
 }
+
+// ---------------------------------------------------------------------------
+// Slack MCP tool exposure policy
+// ---------------------------------------------------------------------------
+
+export const SLACK_MCP_OUTBOUND_TOOL_NAMES = ['reply', 'react', 'edit_message'] as const
+export const SLACK_MCP_READONLY_TOOL_NAMES = ['fetch_messages', 'download_attachment'] as const
+
+const SLACK_MCP_OUTBOUND_TOOL_SET = new Set<string>(SLACK_MCP_OUTBOUND_TOOL_NAMES)
+
+/**
+ * Returns true for MCP tools that directly mutate/post to Slack.
+ *
+ * The thread router posts agentapi output back to Slack itself. Thread-scoped
+ * child Claude sessions may still need Slack history/file read tools, but they
+ * must never bypass the router by calling reply/react/edit directly.
+ */
+export function isSlackMcpOutboundToolName(name: string): boolean {
+  return SLACK_MCP_OUTBOUND_TOOL_SET.has(name)
+}
+
+export function slackMcpToolNamesForMode(canSendOutbound: boolean): string[] {
+  return canSendOutbound
+    ? [...SLACK_MCP_OUTBOUND_TOOL_NAMES, ...SLACK_MCP_READONLY_TOOL_NAMES]
+    : [...SLACK_MCP_READONLY_TOOL_NAMES]
+}
