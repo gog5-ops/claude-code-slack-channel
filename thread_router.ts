@@ -82,6 +82,7 @@ const TUI_TIMED_STATUS_RE =
 const TUI_TOOL_STATUS_RE = /^(?:Ran|Searched|Called)\b(?:\s|:|$)/
 const SLACK_INBOUND_ECHO_RE = /^←\s*slack\s*·\s*/i
 const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
+const CONTEXT_USAGE_RE = /^(\d+%)\s+context used$/i
 const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?))/
 const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 
@@ -316,6 +317,12 @@ export function sanitizeAgentReply(content: string): string {
 
     if (trimmed && SLACK_INBOUND_ECHO_RE.test(trimmed)) {
       skippingSlackEchoContinuation = true
+      continue
+    }
+
+    const contextUsage = trimmed.match(CONTEXT_USAGE_RE)
+    if (contextUsage) {
+      sanitizedLines.push(`${contextUsage[1]} context used`)
       continue
     }
 

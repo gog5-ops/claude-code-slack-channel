@@ -1978,6 +1978,14 @@ describe('thread_router forwardMessage', () => {
     expect(sanitizeAgentReply('First\n\n\n\nSecond\n\n\nThird')).toBe('First\n\nSecond\n\nThird')
   })
 
+  test('sanitizeAgentReply normalizes padded context usage lines', () => {
+    expect(
+      sanitizeAgentReply(
+        '                                                               11% context used',
+      ),
+    ).toBe('11% context used')
+  })
+
   test('sanitizeAgentReply strips live Slack echo while preserving context usage lines', () => {
     expect(
       sanitizeAgentReply(
