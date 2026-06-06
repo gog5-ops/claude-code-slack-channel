@@ -2260,12 +2260,100 @@ describe('thread_router forwardMessage', () => {
       '/status',
       '/status',
       '/messages',
+      '/messages',
     ])
     expect(calls[0]!.init?.method).toBe('POST')
     expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
       content: 'hello',
       type: 'user',
     })
+  })
+
+  test('waits for latest agent message content to settle before returning reply', async () => {
+    const messageBodies = [
+      {
+        messages: [
+          {
+            id: 14,
+            role: 'agent',
+            content: '这是 thread ... 主要内容：\n\n14% context used',
+            time: '2026-06-06T00:00:01.000Z',
+          },
+        ],
+      },
+      {
+        messages: [
+          {
+            id: 14,
+            role: 'agent',
+            content: [
+              '这是 thread 的完整回复，主要内容：',
+              '',
+              '1. 第一项',
+              '2. 第二项',
+              '3. 第三项',
+              '4. 第四项',
+              '5. 第五项',
+              '6. 第六项',
+            ].join('\n'),
+            time: '2026-06-06T00:00:01.000Z',
+          },
+        ],
+      },
+      {
+        messages: [
+          {
+            id: 14,
+            role: 'agent',
+            content: [
+              '这是 thread 的完整回复，主要内容：',
+              '',
+              '1. 第一项',
+              '2. 第二项',
+              '3. 第三项',
+              '4. 第四项',
+              '5. 第五项',
+              '6. 第六项',
+            ].join('\n'),
+            time: '2026-06-06T00:00:01.000Z',
+          },
+        ],
+      },
+    ]
+    const calls: string[] = []
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      calls.push(new URL(url).pathname)
+      if (url.endsWith('/message')) {
+        expect(init?.method).toBe('POST')
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(JSON.stringify(messageBodies.shift() || messageBodies.at(-1)), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 50,
+    })
+
+    expect(reply).toContain('6. 第六项')
+    expect(reply).not.toBe('这是 thread ... 主要内容：\n\n14% context used')
+    expect(calls.filter((path) => path === '/messages')).toHaveLength(3)
   })
 
   test('preserves forwarded attachment paths without repeating Slack startup context', async () => {

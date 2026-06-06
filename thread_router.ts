@@ -55,6 +55,7 @@ export interface ThreadRouterOptions {
   activationTimeoutMs?: number
   statusPollMs?: number
   forwardTimeoutMs?: number
+  messageSettleMs?: number
   includeSlackContext?: boolean
 }
 
@@ -80,6 +81,8 @@ const DEFAULT_LOCK_POLL_MS = 50
 const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000
 const DEFAULT_STATUS_POLL_MS = 1_000
 const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
+const DEFAULT_MESSAGE_SETTLE_MS = 750
+const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
 const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
@@ -271,7 +274,7 @@ export async function forwardMessage(
 ): Promise<string> {
   const fetchImpl = options.fetch || fetch
   const baseUrl = `http://127.0.0.1:${port}`
-  const content = meta
+  const forwardedContent = meta
     ? formatForwardedMessage(text, meta, {
       includeSlackContext: options.includeSlackContext ?? true,
     })
@@ -280,16 +283,55 @@ export async function forwardMessage(
   await fetchJson<{ ok?: boolean }>(fetchImpl, `${baseUrl}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content, type: 'user' }),
+    body: JSON.stringify({ content: forwardedContent, type: 'user' }),
   })
 
   await waitForStable(port, options)
 
-  const body = await fetchJson<MessagesBody>(fetchImpl, `${baseUrl}/messages`)
+  const content = await waitForSettledAgentMessageContent(port, options)
+  return sanitizeAgentReply(content)
+}
+
+async function waitForSettledAgentMessageContent(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<string> {
+  const settleMs = Math.max(0, options.messageSettleMs ?? DEFAULT_MESSAGE_SETTLE_MS)
+  const pollMs = Math.max(
+    1,
+    Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, DEFAULT_MESSAGE_SETTLE_POLL_MS),
+  )
+  const deadline = Date.now() + settleMs
+  let previousContent: string | undefined
+  let latestContent: string | undefined
+  let hasPrevious = false
+
+  while (true) {
+    latestContent = await fetchLatestAgentMessageContent(port, options)
+    if (
+      latestContent !== undefined &&
+      hasPrevious &&
+      latestContent === previousContent
+    ) return latestContent
+    previousContent = latestContent
+    hasPrevious = true
+
+    const remainingMs = deadline - Date.now()
+    if (settleMs === 0 || remainingMs <= 0) return latestContent || ''
+    await sleep(Math.min(pollMs, remainingMs))
+  }
+}
+
+async function fetchLatestAgentMessageContent(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  const fetchImpl = options.fetch || fetch
+  const body = await fetchJson<MessagesBody>(fetchImpl, `http://127.0.0.1:${port}/messages`)
   const agentMessages = (body.messages || []).filter(
     (message) => message.role === 'agent' && typeof message.content === 'string',
   )
-  return sanitizeAgentReply(agentMessages.at(-1)?.content || '')
+  return agentMessages.at(-1)?.content
 }
 
 export function sanitizeAgentReply(content: string): string {
