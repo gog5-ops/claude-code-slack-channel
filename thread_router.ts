@@ -72,6 +72,17 @@ const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000
 const DEFAULT_STATUS_POLL_MS = 1_000
 const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
+const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
+const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
+const TUI_PREFIX_RE = /^[ \t]*[●⏺]\s*/
+const TUI_TIMED_STATUS_RE =
+  /^[✻✶✱✢]\s+.*\bfor\s+\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b/i
+const TUI_TOOL_STATUS_RE = /^(?:Ran|Searched|Called)\b(?:\s|:|$)/
+const SLACK_INBOUND_ECHO_RE = /^←\s*slack\s*·\s*/i
+const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
+const CONTEXT_USAGE_RE = /^\d{1,3}%\s+context\s+used\b/i
+const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?))/
+const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -244,7 +255,85 @@ export async function forwardMessage(
   const agentMessages = (body.messages || []).filter(
     (message) => message.role === 'agent' && typeof message.content === 'string',
   )
-  return agentMessages.at(-1)?.content || ''
+  return sanitizeAgentReply(agentMessages.at(-1)?.content || '')
+}
+
+export function sanitizeAgentReply(content: string): string {
+  const sanitizedLines: string[] = []
+  let inFence = false
+  let fenceMarker = ''
+  let skippingSlackEchoContinuation = false
+
+  for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmedStart = line.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+
+    if (inFence) {
+      sanitizedLines.push(line)
+      if (fence && fence[0] === fenceMarker[0] && fence.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+      continue
+    }
+
+    if (fence) {
+      sanitizedLines.push(line)
+      inFence = true
+      fenceMarker = fence
+      continue
+    }
+
+    const withoutTuiPrefix = line.replace(TUI_PREFIX_RE, '')
+    const trimmed = withoutTuiPrefix.trim()
+    if (skippingSlackEchoContinuation) {
+      if (!trimmed) {
+        skippingSlackEchoContinuation = false
+        sanitizedLines.push('')
+        continue
+      }
+
+      if (SLACK_ECHO_CONTINUATION_RE.test(trimmed)) {
+        continue
+      }
+
+      skippingSlackEchoContinuation = false
+    }
+
+    if (
+      trimmed &&
+      (TUI_TIMED_STATUS_RE.test(trimmed) ||
+        TUI_TOOL_STATUS_RE.test(trimmed) ||
+        CONTEXT_USAGE_RE.test(trimmed))
+    ) {
+      continue
+    }
+
+    if (trimmed && SLACK_INBOUND_ECHO_RE.test(trimmed)) {
+      skippingSlackEchoContinuation = true
+      continue
+    }
+
+    sanitizedLines.push(normalizeReplyLine(withoutTuiPrefix))
+  }
+
+  return sanitizedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function normalizeReplyLine(line: string): string {
+  if (!line.trim()) return ''
+
+  const markdownPrefix = line.match(MARKDOWN_LINE_PREFIX_RE)?.[1]
+  if (markdownPrefix) {
+    return markdownPrefix + line.slice(markdownPrefix.length).replace(EXCESS_HORIZONTAL_SPACE_RE, ' ')
+  }
+
+  if (/^(?: {4,}|\t)/.test(line)) {
+    return line
+  }
+
+  return line.trimStart().replace(EXCESS_HORIZONTAL_SPACE_RE, ' ')
 }
 
 function escapeAttr(value: string): string {
@@ -260,7 +349,34 @@ export function formatForwardedMessage(text: string, meta: Record<string, string
     .filter(([, value]) => value !== '')
     .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
     .join(' ')
-  return `<channel source="slack" ${attrs}>\n${text}\n</channel>`
+  return `${buildSlackContextPrompt(meta)}\n\n<channel source="slack" ${attrs}>\n${text}\n</channel>`
+}
+
+export function buildSlackContextPrompt(meta: Record<string, string>): string {
+  const attrs: Record<string, string> = {
+    channel_id: meta['chat_id'] || '',
+    thread_ts: meta['thread_ts'] || meta['ts'] || '',
+    ts: meta['ts'] || '',
+    user: meta['user'] || '',
+    user_id: meta['user_id'] || '',
+    message_id: meta['message_id'] || meta['ts'] || '',
+    attachment_count: meta['attachment_count'] || '0',
+  }
+  if (meta['attachment_paths']) {
+    attrs.attachment_paths = meta['attachment_paths']
+  }
+
+  const renderedAttrs = Object.entries(attrs)
+    .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
+    .join(' ')
+
+  return [
+    `<slack_context ${renderedAttrs}>`,
+    'You are replying in this Slack thread. Answer concisely for Slack.',
+    'If attachment_paths is present, inspect those local files with Read/Bash as needed before answering.',
+    'If context, history, search results, or attachments are missing, say what to fetch instead of assuming.',
+    '</slack_context>',
+  ].join('\n')
 }
 
 export async function cleanupIdle(

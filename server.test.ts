@@ -30,11 +30,13 @@ import {
 } from './lib.ts'
 import {
   buildSessionKey,
+  buildSlackContextPrompt,
   cleanupIdle,
   ensureSession,
   forwardMessage,
   readRegistry,
   registryFilePath,
+  sanitizeAgentReply,
   sessionKeyFromMeta,
   writeRegistry,
   type SpawnAgent,
@@ -1813,6 +1815,128 @@ describe('thread_router cleanupIdle', () => {
 })
 
 describe('thread_router forwardMessage', () => {
+  test('buildSlackContextPrompt describes Slack thread context concisely', () => {
+    const prompt = buildSlackContextPrompt({
+      chat_id: 'C123',
+      thread_ts: '1800000000.000001',
+      ts: '1800000000.000002',
+      message_id: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+    })
+
+    expect(prompt.length).toBeLessThan(1000)
+    expect(prompt).toContain('<slack_context ')
+    expect(prompt).toContain('channel_id="C123"')
+    expect(prompt).toContain('thread_ts="1800000000.000001"')
+    expect(prompt).toContain('ts="1800000000.000002"')
+    expect(prompt).toContain('message_id="1800000000.000002"')
+    expect(prompt).toContain('user="casey"')
+    expect(prompt).toContain('user_id="U123"')
+    expect(prompt).toContain('attachment_count="0"')
+    expect(prompt).toContain('You are replying in this Slack thread')
+    expect(prompt).toContain('Answer concisely for Slack')
+    expect(prompt).toContain('say what to fetch instead of assuming')
+    expect(prompt).not.toContain('attachment_paths=')
+  })
+
+  test('buildSlackContextPrompt exposes attachment paths when present', () => {
+    const prompt = buildSlackContextPrompt({
+      chat_id: 'C123',
+      ts: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+      message_id: '1800000000.000002',
+      attachment_count: '2',
+      attachment_paths: '/tmp/a.txt; /tmp/b.txt',
+    })
+
+    expect(prompt.length).toBeLessThan(1000)
+    expect(prompt).toContain('thread_ts="1800000000.000002"')
+    expect(prompt).toContain('attachment_count="2"')
+    expect(prompt).toContain('attachment_paths="/tmp/a.txt; /tmp/b.txt"')
+    expect(prompt).toContain('inspect those local files with Read/Bash')
+  })
+
+  test('sanitizeAgentReply removes leading TUI bullet marker and terminal padding', () => {
+    expect(
+      sanitizeAgentReply('● Actual reply text                         \n  - keep markdown bullet      '),
+    ).toBe('Actual reply text\n  - keep markdown bullet')
+  })
+
+  test('sanitizeAgentReply strips tool and timed status lines outside code fences', () => {
+    expect(
+      sanitizeAgentReply(
+        [
+          '● Here is the result.',
+          '✻ Crunched for 16s',
+          'Ran Bash(npx tsc --noEmit)',
+          'Searched files for "forwardMessage"',
+          'Called read_file',
+          '```text',
+          'Ran this line as example output   ',
+          '✻ Crunched for 16s   ',
+          '```',
+          'Done.',
+        ].join('\n'),
+      ),
+    ).toBe(
+      [
+        'Here is the result.',
+        '```text',
+        'Ran this line as example output',
+        '✻ Crunched for 16s',
+        '```',
+        'Done.',
+      ].join('\n'),
+    )
+  })
+
+  test('sanitizeAgentReply collapses excessive blank lines', () => {
+    expect(sanitizeAgentReply('First\n\n\n\nSecond\n\n\nThird')).toBe('First\n\nSecond\n\nThird')
+  })
+
+  test('sanitizeAgentReply strips live Slack echo and context usage artifacts', () => {
+    expect(
+      sanitizeAgentReply(
+        [
+          '← slack · hermes-smoke: Smoke test: you are in Slack. Verify you can see the attach…',
+          '                                                               10% context used',
+          '● I can see the attachment       and\t\twill review it.',
+          '  - Keep      markdown\t\tbullet indentation',
+          '```text',
+          '← slack · hermes-smoke: Smoke test: you are in Slack. Verify you can see the attach…',
+          '                                                               10% context used',
+          'padded       terminal\t\ttext',
+          '```',
+        ].join('\n'),
+      ),
+    ).toBe(
+      [
+        'I can see the attachment and will review it.',
+        '  - Keep markdown bullet indentation',
+        '```text',
+        '← slack · hermes-smoke: Smoke test: you are in Slack. Verify you can see the attach…',
+        '                                                               10% context used',
+        'padded       terminal\t\ttext',
+        '```',
+      ].join('\n'),
+    )
+  })
+
+  test('sanitizeAgentReply strips wrapped live Slack echo continuation', () => {
+    expect(
+      sanitizeAgentReply(
+        [
+          '← slack · hermes-smoke: Smoke test after sanitizer fix. Do not call Slack. Reply',
+          'ex…',
+          '',
+          'SLACK_SMOKE_OK attachment_count=1',
+        ].join('\n'),
+      ),
+    ).toBe('SLACK_SMOKE_OK attachment_count=1')
+  })
+
   test('posts user message, polls status, and returns last agent message', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const statuses = ['running', 'stable']
@@ -1871,6 +1995,74 @@ describe('thread_router forwardMessage', () => {
       content: 'hello',
       type: 'user',
     })
+  })
+
+  test('preserves forwarded metadata with attachment paths and sanitizes agent reply', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      calls.push({ url, init })
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                id: 2,
+                role: 'agent',
+                content: '● attached response      \n✻ Crunched for 1s',
+                time: '2026-06-06T00:00:01.000Z',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(
+      3099,
+      'hello',
+      {
+        fetch: fetchMock,
+        statusPollMs: 1,
+      },
+      {
+        chat_id: 'C123',
+        thread_ts: '1800000000.000001',
+        ts: '1800000000.000002',
+        message_id: '1800000000.000002',
+        user: 'casey',
+        user_id: 'U123',
+        attachment_count: '2',
+        attachment_paths: '/tmp/a.txt; /tmp/b.txt',
+      },
+    )
+
+    expect(reply).toBe('attached response')
+    const posted = JSON.parse(String(calls[0]!.init?.body))
+    expect(posted.type).toBe('user')
+    expect(posted.content).toContain(
+      '<slack_context channel_id="C123" thread_ts="1800000000.000001" ts="1800000000.000002" user="casey" user_id="U123" message_id="1800000000.000002" attachment_count="2" attachment_paths="/tmp/a.txt; /tmp/b.txt">',
+    )
+    expect(posted.content).toContain('You are replying in this Slack thread')
+    expect(posted.content).toContain('Answer concisely for Slack')
+    expect(posted.content).toContain('inspect those local files with Read/Bash')
+    expect(posted.content).toContain('say what to fetch instead of assuming')
+    expect(posted.content).toContain(
+      '<channel source="slack" chat_id="C123" thread_ts="1800000000.000001" ts="1800000000.000002" message_id="1800000000.000002" user="casey" user_id="U123" attachment_count="2" attachment_paths="/tmp/a.txt; /tmp/b.txt">\nhello\n</channel>',
+    )
   })
 })
 
