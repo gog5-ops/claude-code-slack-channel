@@ -2649,6 +2649,103 @@ describe('thread_router forwardMessage', () => {
     expect(messageAttempts).toBe(3)
   })
 
+  test('re-polls /messages and recovers the real reply when it settles empty/context-only', async () => {
+    // Post-settle flush race: status is stable but the first /messages snapshot is
+    // context-only; the full reply lands on a subsequent poll. Re-polling recovers
+    // it instead of delivering a header-only / context-only truncation
+    // (opshub#155, Phase 5 follow-up).
+    const full = [
+      'Topview 生成 skill 共 4 个：',
+      '',
+      '1) topview-skill',
+      '2) topview2api',
+      '3) deep-research',
+      '4) drama-studio',
+      '',
+      '12% context used',
+    ].join('\n')
+    let messagesCalls = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        messagesCalls += 1
+        // First snapshot (the settle result) is context-only; the real reply
+        // lands on the next poll.
+        const content = messagesCalls <= 1 ? '12% context used' : full
+        return new Response(
+          JSON.stringify({
+            messages: [{ id: 1, role: 'agent', content, time: '2026-06-06T00:00:01.000Z' }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 0,
+    })
+
+    expect(reply).toContain('1) topview-skill')
+    expect(reply).toContain('4) drama-studio')
+    expect(reply).not.toBe('12% context used')
+  })
+
+  test('re-poll for an empty/context-only reply is bounded and falls through', async () => {
+    // If /messages never yields a real reply, the re-poll must give up within its
+    // budget (no hang) and fall through to the existing fallback — here, with no
+    // JSONL, the context-only result (opshub#155, Phase 5 follow-up).
+    let messagesCalls = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        messagesCalls += 1
+        return new Response(
+          JSON.stringify({
+            messages: [{ id: 1, role: 'agent', content: '12% context used', time: '2026-06-06T00:00:01.000Z' }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      replyRepollMs: 30, // tiny real budget keeps the test fast
+    })
+
+    expect(reply).toBe('12% context used')
+    // Re-poll actually ran (more than the single settle fetch) but stayed bounded.
+    expect(messagesCalls).toBeGreaterThan(1)
+  })
+
   test('falls back to Claude project JSONL when AgentAPI messages are context-only', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-jsonl-fallback-'))
     const cwd = join(rawRoot, 'repo')
@@ -2742,6 +2839,9 @@ describe('thread_router forwardMessage', () => {
           includeSlackContext: false,
           statusPollMs: 1,
           messageSettleMs: 0,
+          // /messages stays context-only here; skip the re-poll to test the pure
+          // JSONL fallback path without waiting out the re-poll budget.
+          replyRepollMs: 0,
         },
         meta,
       )

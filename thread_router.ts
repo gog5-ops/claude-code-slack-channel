@@ -57,6 +57,7 @@ export interface ThreadRouterOptions {
   forwardTimeoutMs?: number
   messageSettleMs?: number
   messagePostRetryMs?: number
+  replyRepollMs?: number
   includeSlackContext?: boolean
   claudeProjectsDir?: string
   heartbeatMs?: number
@@ -100,6 +101,11 @@ const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
 // was too short post-recycle (opshub#155, Phase 5 follow-up).
 const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 30_000
 const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
+// Budget for re-polling /messages when it settles empty/context-only after the
+// agent is stable. agentapi can briefly lag the final assistant text behind the
+// stable status; re-polling recovers the real reply instead of falling back to a
+// possibly-partial JSONL (opshub#155, Phase 5 follow-up).
+const DEFAULT_REPLY_REPOLL_MS = 3_000
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
 const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
@@ -324,8 +330,23 @@ export async function forwardMessage(
 
   await waitForStable(port, options, options.onHeartbeat)
 
-  const content = await waitForSettledAgentMessageContent(port, options)
-  const sanitized = sanitizeAgentReply(content)
+  let content = await waitForSettledAgentMessageContent(port, options)
+  let sanitized = sanitizeAgentReply(content)
+
+  // Post-settle flush race: status can report stable while agentapi /messages is
+  // momentarily empty/context-only before the final assistant text lands. Rather
+  // than immediately fall back to a possibly-partial JSONL (which delivered a
+  // header-only "header\n\nN% context used"), re-poll /messages briefly for the
+  // real reply. Startup-artifact screens aren't empty/context-only, so they skip
+  // this and keep their JSONL-fallback handling (opshub#155, Phase 5 follow-up).
+  if (replyNeedsJsonlFallback(sanitized) && !replyIsStartupArtifact(sanitized)) {
+    const recovered = await repollMeaningfulAgentReply(port, options)
+    if (recovered !== undefined) {
+      content = recovered
+      sanitized = sanitizeAgentReply(content)
+    }
+  }
+
   const contextUsageLine = latestContextUsageLine(content)
   // A fresh worker's first /messages snapshot can be the Claude startup /
   // context-index screen rather than a reply to the just-posted message. Treat
@@ -560,6 +581,36 @@ async function fetchLatestAgentMessageContent(
     (message) => message.role === 'agent' && typeof message.content === 'string',
   )
   return agentMessages.at(-1)?.content
+}
+
+// After the agent is stable but /messages settled empty/context-only, re-poll
+// briefly for a real reply (a flush race). Returns the raw /messages content once
+// it sanitizes to a real reply (non-fallback, non-startup-artifact), or undefined
+// if the budget expires — in which case the caller keeps its existing JSONL /
+// context-only fallback (opshub#155, Phase 5 follow-up).
+async function repollMeaningfulAgentReply(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  const budgetMs = Math.max(0, options.replyRepollMs ?? DEFAULT_REPLY_REPOLL_MS)
+  if (budgetMs === 0) return undefined
+  const pollMs = Math.max(
+    1,
+    Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, DEFAULT_MESSAGE_SETTLE_POLL_MS),
+  )
+  const now = options.now || Date.now
+  const deadline = now() + budgetMs
+
+  while (now() < deadline) {
+    await sleep(Math.min(pollMs, Math.max(1, deadline - now())))
+    const content = await fetchLatestAgentMessageContent(port, options)
+    if (content === undefined) continue
+    const sanitized = sanitizeAgentReply(content)
+    if (!replyNeedsJsonlFallback(sanitized) && !replyIsStartupArtifact(sanitized)) {
+      return content
+    }
+  }
+  return undefined
 }
 
 export function sanitizeAgentReply(content: string): string {
