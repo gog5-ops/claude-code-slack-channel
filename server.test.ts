@@ -2287,6 +2287,191 @@ describe('thread_router forwardMessage', () => {
     })
   })
 
+  test('falls back to Claude project JSONL when AgentAPI messages are context-only', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-jsonl-fallback-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C123',
+      thread_ts: '1800000000.000001',
+      ts: '1800000000.000002',
+      message_id: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({
+                type: 'user',
+                uuid: 'user-1',
+                timestamp: '2026-06-06T00:00:00.000Z',
+                message: { role: 'user', content: 'hello' },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: '<synthetic>',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'No response requested.' }],
+                },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'thinking', thinking: 'hidden' }],
+                },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'real assistant text from jsonl' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [
+                {
+                  id: 2,
+                  role: 'agent',
+                  content: '                                                               16% context used',
+                  time: '2026-06-06T00:00:01.000Z',
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+        },
+        meta,
+      )
+
+      expect(reply).toBe('real assistant text from jsonl')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('does not use JSONL fallback when AgentAPI messages contain a normal reply', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-no-jsonl-fallback-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C123',
+      thread_ts: '1800000000.000001',
+      ts: '1800000000.000002',
+      message_id: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'jsonl should not win' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [
+                {
+                  id: 2,
+                  role: 'agent',
+                  content: 'normal AgentAPI reply',
+                  time: '2026-06-06T00:00:01.000Z',
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+        },
+        meta,
+      )
+
+      expect(reply).toBe('normal AgentAPI reply')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
   test('waits for latest agent message content to settle before returning reply', async () => {
     const messageBodies = [
       {

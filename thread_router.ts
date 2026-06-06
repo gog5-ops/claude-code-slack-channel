@@ -57,6 +57,7 @@ export interface ThreadRouterOptions {
   forwardTimeoutMs?: number
   messageSettleMs?: number
   includeSlackContext?: boolean
+  claudeProjectsDir?: string
 }
 
 interface AgentStatusBody {
@@ -72,6 +73,11 @@ interface AgentMessage {
 
 interface MessagesBody {
   messages?: AgentMessage[]
+}
+
+interface ClaudeJsonlFallbackState {
+  path: string
+  lineCount: number
 }
 
 const DEFAULT_BASE_PORT = 3010
@@ -281,6 +287,9 @@ export async function forwardMessage(
       includeSlackContext: options.includeSlackContext ?? true,
     })
     : text
+  const jsonlFallbackState = meta
+    ? await captureClaudeJsonlFallbackState(meta, options)
+    : undefined
 
   await fetchJson<{ ok?: boolean }>(fetchImpl, `${baseUrl}/message`, {
     method: 'POST',
@@ -291,7 +300,112 @@ export async function forwardMessage(
   await waitForStable(port, options)
 
   const content = await waitForSettledAgentMessageContent(port, options)
-  return sanitizeAgentReply(content)
+  const sanitized = sanitizeAgentReply(content)
+  if (!replyNeedsJsonlFallback(sanitized)) return sanitized
+
+  const jsonlContent = jsonlFallbackState
+    ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
+    : undefined
+  const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
+  return sanitizedJsonl || sanitized
+}
+
+async function captureClaudeJsonlFallbackState(
+  meta: Record<string, string>,
+  options: ThreadRouterOptions,
+): Promise<ClaudeJsonlFallbackState | undefined> {
+  try {
+    const key = sessionKeyFromMeta(meta)
+    const sessionId = claudeSessionIdForKey(key)
+    const path = claudeProjectSessionJsonlPath(
+      options.cwd || process.cwd(),
+      sessionId,
+      options.claudeProjectsDir,
+    )
+    return { path, lineCount: await countExistingJsonlLines(path) }
+  } catch {
+    return undefined
+  }
+}
+
+async function countExistingJsonlLines(path: string): Promise<number> {
+  try {
+    const raw = await readFile(path, 'utf8')
+    if (!raw) return 0
+    return raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return 0
+    throw err
+  }
+}
+
+function replyNeedsJsonlFallback(reply: string): boolean {
+  const trimmed = reply.trim()
+  if (!trimmed) return true
+  return trimmed.split('\n').every((line) => CONTEXT_USAGE_RE.test(line.trim()))
+}
+
+async function fetchLatestClaudeJsonlAssistantText(
+  state: ClaudeJsonlFallbackState,
+): Promise<string | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(state.path, 'utf8')
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return undefined
+    throw err
+  }
+
+  const lines = raw.split('\n').filter((line) => line.trim())
+  let sawPostedUser = false
+  let latestText: string | undefined
+
+  for (const line of lines.slice(state.lineCount)) {
+    let entry: unknown
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!entry || typeof entry !== 'object') continue
+    const record = entry as Record<string, unknown>
+
+    if (record['type'] === 'user' && record['isMeta'] !== true) {
+      sawPostedUser = true
+      continue
+    }
+    if (!sawPostedUser || record['type'] !== 'assistant') continue
+
+    const assistantText = extractClaudeAssistantText(record)
+    if (assistantText && !isIgnoredClaudeAssistantText(assistantText)) latestText = assistantText
+  }
+
+  return latestText
+}
+
+function extractClaudeAssistantText(record: Record<string, unknown>): string {
+  const message = record['message']
+  if (!message || typeof message !== 'object') return ''
+  const messageRecord = message as Record<string, unknown>
+  if (messageRecord['model'] === '<synthetic>') return ''
+  const content = messageRecord['content']
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+
+  return content
+    .map((part) => {
+      if (!part || typeof part !== 'object') return ''
+      const partRecord = part as Record<string, unknown>
+      return partRecord['type'] === 'text' && typeof partRecord['text'] === 'string'
+        ? partRecord['text']
+        : ''
+    })
+    .filter((part) => part.trim())
+    .join('\n')
+}
+
+function isIgnoredClaudeAssistantText(text: string): boolean {
+  return /^no response requested\.?$/i.test(text.trim())
 }
 
 async function waitForSettledAgentMessageContent(
