@@ -2323,6 +2323,41 @@ describe('thread_router forwardMessage', () => {
     ).toBe('SLACK_SMOKE_OK attachment_count=1')
   })
 
+  test('sanitizeAgentReply preserves an indented numbered list (not just header + context)', () => {
+    // Regression for the live truncation where Slack showed only
+    // "Topview 生成 skill 共 4 个：\n\n12% context used" while the raw agentapi
+    // content held the full 1-4 list. Indented "N)" list lines and their wrapped
+    // continuation lines must NOT be treated as transient TUI/status just because
+    // they are indented or spaced (opshub#155, Phase 5 follow-up).
+    const raw = [
+      '⏺ Topview 生成 skill 共 4 个：                         ',
+      '',
+      '  1) topview-skill — 官方 API key 出图/出视频（付费，spot-rescue 兜底）',
+      '     session-independent，按官方额度计费',
+      '  2) topview2api — 自建反代，OpenAI 兼容，零积分（unlimited），localhost:8060',
+      '  3) deep-research — 多源检索 + 对抗校验 + 引用报告',
+      '     先澄清范围再 fan-out',
+      '  4) drama-studio — 重新生成提示词（faithful / natural / director 三模式）',
+      '',
+      '12% context used',
+    ].join('\n')
+
+    const out = sanitizeAgentReply(raw)
+
+    // The bug signature: everything between header and context collapsed away.
+    expect(out).not.toBe('Topview 生成 skill 共 4 个：\n\n12% context used')
+    // Header, all four items, and the context footer survive.
+    expect(out).toContain('Topview 生成 skill 共 4 个')
+    expect(out).toContain('1) topview-skill')
+    expect(out).toContain('2) topview2api')
+    expect(out).toContain('3) deep-research')
+    expect(out).toContain('4) drama-studio')
+    expect(out).toContain('session-independent') // wrapped continuation line kept
+    expect(out).toContain('12% context used')
+    // The TUI bullet on the header is stripped but the list is intact.
+    expect(out.startsWith('Topview 生成 skill 共 4 个')).toBe(true)
+  })
+
   test('posts user message, polls status, and returns last agent message', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const statuses = ['running', 'stable']

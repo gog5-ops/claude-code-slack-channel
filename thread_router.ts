@@ -339,6 +339,15 @@ export async function forwardMessage(
     ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
     : undefined
   const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
+  // Diagnostic (no secrets): a truncated delivery surfaces here as a fallback
+  // path firing — e.g. agentapi /messages went empty/context-only and the JSONL
+  // held only a partial assistant turn, yielding "header\n\nN% context used". Log
+  // the lengths so a future mismatch is attributable to this path vs the
+  // sanitizer or sendReplyToSlack (opshub#155, Phase 5 follow-up).
+  console.error(
+    `[slack] forwardMessage reply fallback (${isStartupArtifact ? 'startup-artifact' : 'agentapi-empty-or-context-only'}): ` +
+      `raw /messages len=${content.length}, agentapi sanitized len=${sanitized.length}, jsonl len=${sanitizedJsonl.length}`,
+  )
   if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
 
   // No real reply from AgentAPI or the JSONL. Never post the raw startup /

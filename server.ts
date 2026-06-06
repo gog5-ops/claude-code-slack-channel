@@ -1068,6 +1068,17 @@ async function deliverToSession(
     return
   }
 
+  // Diagnostic (no secrets): record what we're about to deliver so a future
+  // Slack-vs-agentapi mismatch is attributable to before/after this point. The
+  // snippets are the bot's own reply head/tail with newlines escaped; on the
+  // observed truncation this logs a tiny len with a "header"/"context used"
+  // head/tail (opshub#155, Phase 5 follow-up).
+  const replyHead = replyText.slice(0, 80).replace(/\n/g, '⏎')
+  const replyTail = replyText.slice(-40).replace(/\n/g, '⏎')
+  console.error(
+    `[slack] delivering reply key=${chatId}:${threadTs} len=${replyText.length} head=${JSON.stringify(replyHead)} tail=${JSON.stringify(replyTail)}`,
+  )
+
   // Finalize the progress placeholder in place instead of posting a separate
   // message and leaving "Working…" stranded; an empty reply turns it into a
   // terminal notice. sendReplyToSlack falls back to a fresh post if the first
