@@ -57,6 +57,17 @@ export interface Access {
   chunkMode?: 'length' | 'newline'
 }
 
+export interface OutboundThreadSession {
+  status?: unknown
+}
+
+export type OutboundThreadRegistry = Record<string, OutboundThreadSession>
+
+export interface OutboundGateOptions {
+  activeThreadRegistry?: OutboundThreadRegistry
+  threadTs?: string
+}
+
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
 export interface GateResult {
@@ -635,6 +646,33 @@ export function assertSendable(
 // Security — outbound gate
 // ---------------------------------------------------------------------------
 
+const ACTIVE_THREAD_SESSION_STATUSES = new Set(['active', 'activating'])
+
+function isActiveThreadSession(session: OutboundThreadSession | undefined): boolean {
+  return ACTIVE_THREAD_SESSION_STATUSES.has(String(session?.status || ''))
+}
+
+export function activeThreadRegistryAllowsOutbound(
+  chatId: string,
+  registry: OutboundThreadRegistry | undefined,
+  threadTs?: string,
+): boolean {
+  if (!chatId || !registry) return false
+
+  if (threadTs) {
+    return isActiveThreadSession(registry[`${chatId}:${threadTs}`])
+  }
+
+  for (const [key, session] of Object.entries(registry)) {
+    if (!isActiveThreadSession(session)) continue
+    const separator = key.indexOf(':')
+    if (separator <= 0) continue
+    if (key.slice(0, separator) === chatId) return true
+  }
+
+  return false
+}
+
 /**
  * Throws if `chatId` is neither an opted-in channel nor a previously-delivered
  * channel (DM that passed the inbound gate this session).
@@ -643,9 +681,19 @@ export function assertOutboundAllowed(
   chatId: string,
   access: Access,
   deliveredChannels: ReadonlySet<string>,
+  options: OutboundGateOptions = {},
 ): void {
   if (access.channels[chatId]) return
   if (deliveredChannels.has(chatId)) return
+  if (
+    activeThreadRegistryAllowsOutbound(
+      chatId,
+      options.activeThreadRegistry,
+      options.threadTs,
+    )
+  ) {
+    return
+  }
   throw new Error(
     `Outbound gate: channel ${chatId} is not in the allowlist or opted-in channels.`,
   )

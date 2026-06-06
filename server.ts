@@ -48,6 +48,7 @@ import {
   PERMISSION_REPLY_RE,
   type Access,
   type GateResult,
+  type OutboundThreadRegistry,
 } from './lib.ts'
 import { claimSlackContextForSession, ensureSession, forwardMessage } from './thread_router.ts'
 
@@ -61,6 +62,7 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
+const THREAD_REGISTRY_FILE = join(STATE_DIR, 'thread_sessions.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DEFAULT_CHUNK_LIMIT = 4000
 
@@ -273,8 +275,35 @@ const seenEvents = new Map<string, number>()
 let lastActiveChannel = ''
 let lastActiveThread: string | undefined
 
-function assertOutboundAllowed(chatId: string): void {
-  libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
+function loadOutboundThreadRegistry(): OutboundThreadRegistry | undefined {
+  if (!existsSync(THREAD_REGISTRY_FILE)) return undefined
+
+  try {
+    const parsed = JSON.parse(readFileSync(THREAD_REGISTRY_FILE, 'utf-8')) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+
+    const registry: OutboundThreadRegistry = {}
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+      const status = (value as Record<string, unknown>)['status']
+      if (status === 'active' || status === 'activating') {
+        registry[key] = { status }
+      }
+    }
+    return registry
+  } catch {
+    return undefined
+  }
+}
+
+function assertOutboundAllowed(
+  chatId: string,
+  options: { threadTs?: string } = {},
+): void {
+  libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels, {
+    activeThreadRegistry: loadOutboundThreadRegistry(),
+    threadTs: options.threadTs,
+  })
 }
 
 async function sendReplyToSlack(args: {
@@ -564,9 +593,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // -----------------------------------------------------------------------
     case 'fetch_messages': {
       const channel: string = args.channel
-      assertOutboundAllowed(channel)
       const limit = Math.min(args.limit || 20, 100)
       const threadTs: string | undefined = args.thread_ts
+      assertOutboundAllowed(channel, { threadTs })
 
       let messages: any[]
       if (threadTs) {

@@ -638,6 +638,65 @@ describe('assertOutboundAllowed', () => {
     const delivered = new Set(['D_DIFFERENT'])
     expect(() => assertOutboundAllowed('C_ATTACKER', access, delivered)).toThrow('Outbound gate')
   })
+
+  test('allows channels with an active thread session registry entry', () => {
+    const access = makeAccess({ channels: {} })
+    const registry = {
+      'D0ATZTYC3KN:1800000000.000001': { status: 'active' },
+    }
+
+    expect(() =>
+      assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
+        activeThreadRegistry: registry,
+      }),
+    ).not.toThrow()
+  })
+
+  test('blocks unknown channels when registry only contains a different channel', () => {
+    const access = makeAccess({ channels: {} })
+    const registry = {
+      'D0ATZTYC3KN:1800000000.000001': { status: 'active' },
+    }
+
+    expect(() =>
+      assertOutboundAllowed('C_UNKNOWN', access, new Set(), {
+        activeThreadRegistry: registry,
+      }),
+    ).toThrow('Outbound gate')
+  })
+
+  test('requires exact registry key when thread_ts is provided', () => {
+    const access = makeAccess({ channels: {} })
+    const registry = {
+      'D0ATZTYC3KN:1800000000.000001': { status: 'activating' },
+    }
+
+    expect(() =>
+      assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
+        activeThreadRegistry: registry,
+        threadTs: '1800000000.000001',
+      }),
+    ).not.toThrow()
+    expect(() =>
+      assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
+        activeThreadRegistry: registry,
+        threadTs: '1800000000.000002',
+      }),
+    ).toThrow('Outbound gate')
+  })
+
+  test('ignores archived thread session registry entries', () => {
+    const access = makeAccess({ channels: {} })
+    const registry = {
+      'D0ATZTYC3KN:1800000000.000001': { status: 'archived' },
+    }
+
+    expect(() =>
+      assertOutboundAllowed('D0ATZTYC3KN', access, new Set(), {
+        activeThreadRegistry: registry,
+      }),
+    ).toThrow('Outbound gate')
+  })
 })
 
 // ---------------------------------------------------------------------------
