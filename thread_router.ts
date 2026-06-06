@@ -16,6 +16,7 @@ export interface ThreadSession {
   created_at: string
   last_active_at: string
   cwd: string
+  slack_context_sent_at?: string
 }
 
 export type ThreadSessionRegistry = Record<string, ThreadSession>
@@ -47,6 +48,7 @@ export interface ThreadRouterOptions {
   activationTimeoutMs?: number
   statusPollMs?: number
   forwardTimeoutMs?: number
+  includeSlackContext?: boolean
 }
 
 interface AgentStatusBody {
@@ -80,7 +82,6 @@ const TUI_TIMED_STATUS_RE =
 const TUI_TOOL_STATUS_RE = /^(?:Ran|Searched|Called)\b(?:\s|:|$)/
 const SLACK_INBOUND_ECHO_RE = /^←\s*slack\s*·\s*/i
 const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
-const CONTEXT_USAGE_RE = /^\d{1,3}%\s+context\s+used\b/i
 const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?))/
 const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 
@@ -241,7 +242,11 @@ export async function forwardMessage(
 ): Promise<string> {
   const fetchImpl = options.fetch || fetch
   const baseUrl = `http://127.0.0.1:${port}`
-  const content = meta ? formatForwardedMessage(text, meta) : text
+  const content = meta
+    ? formatForwardedMessage(text, meta, {
+      includeSlackContext: options.includeSlackContext ?? true,
+    })
+    : text
 
   await fetchJson<{ ok?: boolean }>(fetchImpl, `${baseUrl}/message`, {
     method: 'POST',
@@ -304,8 +309,7 @@ export function sanitizeAgentReply(content: string): string {
     if (
       trimmed &&
       (TUI_TIMED_STATUS_RE.test(trimmed) ||
-        TUI_TOOL_STATUS_RE.test(trimmed) ||
-        CONTEXT_USAGE_RE.test(trimmed))
+        TUI_TOOL_STATUS_RE.test(trimmed))
     ) {
       continue
     }
@@ -344,12 +348,18 @@ function escapeAttr(value: string): string {
     .replace(/>/g, '&gt;')
 }
 
-export function formatForwardedMessage(text: string, meta: Record<string, string>): string {
+export function formatForwardedMessage(
+  text: string,
+  meta: Record<string, string>,
+  options: { includeSlackContext?: boolean } = {},
+): string {
   const attrs = Object.entries(meta)
     .filter(([, value]) => value !== '')
     .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
     .join(' ')
-  return `${buildSlackContextPrompt(meta)}\n\n<channel source="slack" ${attrs}>\n${text}\n</channel>`
+  const channel = `<channel source="slack" ${attrs}>\n${text}\n</channel>`
+  if (options.includeSlackContext === false) return channel
+  return `${buildSlackContextPrompt(meta)}\n\n${channel}`
 }
 
 export function buildSlackContextPrompt(meta: Record<string, string>): string {
@@ -377,6 +387,29 @@ export function buildSlackContextPrompt(meta: Record<string, string>): string {
     'If context, history, search results, or attachments are missing, say what to fetch instead of assuming.',
     '</slack_context>',
   ].join('\n')
+}
+
+export async function claimSlackContextForSession(
+  channel: string,
+  threadTs: string,
+  options: ThreadRouterOptions = {},
+): Promise<boolean> {
+  const stateDir = options.stateDir || defaultStateDir()
+  const key = buildSessionKey(channel, threadTs)
+
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const session = registry[key]
+    if (!session) return true
+    if (session.slack_context_sent_at) return false
+
+    registry[key] = {
+      ...session,
+      slack_context_sent_at: new Date((options.now || Date.now)()).toISOString(),
+    }
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    return true
+  })
 }
 
 export async function cleanupIdle(

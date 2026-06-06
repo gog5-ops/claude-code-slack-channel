@@ -49,7 +49,7 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { ensureSession, forwardMessage } from './thread_router.ts'
+import { claimSlackContextForSession, ensureSession, forwardMessage } from './thread_router.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -932,7 +932,8 @@ async function deliverToSession(text: string, meta: Record<string, string>): Pro
   }
 
   const session = await ensureSession(chatId, threadTs)
-  const replyText = await forwardMessage(session.port, text, {}, meta)
+  const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
+  const replyText = await forwardMessage(session.port, text, { includeSlackContext }, meta)
   if (!replyText.trim()) return
 
   await sendReplyToSlack({

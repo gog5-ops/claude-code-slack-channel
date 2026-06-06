@@ -31,8 +31,10 @@ import {
 import {
   buildSessionKey,
   buildSlackContextPrompt,
+  claimSlackContextForSession,
   cleanupIdle,
   ensureSession,
+  formatForwardedMessage,
   forwardMessage,
   readRegistry,
   registryFilePath,
@@ -1858,6 +1860,86 @@ describe('thread_router forwardMessage', () => {
     expect(prompt).toContain('inspect those local files with Read/Bash')
   })
 
+  test('claims Slack startup context once while preserving later attachment metadata', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-context-'))
+    const tmpRoot = realpathSync.native(rawRoot)
+    const key = buildSessionKey('C123', '1800000000.000001')
+
+    try {
+      await writeRegistry(tmpRoot, {
+        [key]: {
+          session_id: '11111111-1111-5111-8111-111111111111',
+          port: 3099,
+          pid: 1234,
+          status: 'active',
+          created_at: '2026-06-06T00:00:00.000Z',
+          last_active_at: '2026-06-06T00:00:00.000Z',
+          cwd: tmpRoot,
+        },
+      })
+
+      const firstMeta = {
+        chat_id: 'C123',
+        thread_ts: '1800000000.000001',
+        ts: '1800000000.000002',
+        message_id: '1800000000.000002',
+        user: 'casey',
+        user_id: 'U123',
+      }
+      const firstInclude = await claimSlackContextForSession('C123', '1800000000.000001', {
+        stateDir: tmpRoot,
+        now: () => Date.parse('2026-06-06T00:00:01.000Z'),
+      })
+      const firstPayload = formatForwardedMessage('first', firstMeta, {
+        includeSlackContext: firstInclude,
+      })
+
+      expect(firstPayload).toContain('<slack_context ')
+      expect(firstPayload).toContain('You are replying in this Slack thread')
+
+      const secondInclude = await claimSlackContextForSession('C123', '1800000000.000001', {
+        stateDir: tmpRoot,
+      })
+      const secondPayload = formatForwardedMessage('second', {
+        ...firstMeta,
+        ts: '1800000000.000003',
+        message_id: '1800000000.000003',
+      }, {
+        includeSlackContext: secondInclude,
+      })
+
+      expect(secondPayload).not.toContain('<slack_context ')
+      expect(secondPayload).toContain(
+        '<channel source="slack" chat_id="C123" thread_ts="1800000000.000001" ts="1800000000.000003" message_id="1800000000.000003" user="casey" user_id="U123">',
+      )
+
+      const attachmentInclude = await claimSlackContextForSession('C123', '1800000000.000001', {
+        stateDir: tmpRoot,
+      })
+      const attachmentPayload = formatForwardedMessage('screenshot attached', {
+        ...firstMeta,
+        ts: '1800000000.000004',
+        message_id: '1800000000.000004',
+        attachment_count: '1',
+        attachment_paths: '/tmp/screenshot.png',
+      }, {
+        includeSlackContext: attachmentInclude,
+      })
+
+      expect(attachmentPayload).not.toContain('<slack_context ')
+      expect(attachmentPayload).toContain('attachment_count="1"')
+      expect(attachmentPayload).toContain('attachment_paths="/tmp/screenshot.png"')
+      expect(attachmentPayload).toContain(
+        '<channel source="slack" chat_id="C123" thread_ts="1800000000.000001" ts="1800000000.000004" message_id="1800000000.000004" user="casey" user_id="U123" attachment_count="1" attachment_paths="/tmp/screenshot.png">',
+      )
+
+      const updated = await readRegistry(tmpRoot)
+      expect(updated[key]?.slack_context_sent_at).toBe('2026-06-06T00:00:01.000Z')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
   test('sanitizeAgentReply removes leading TUI bullet marker and terminal padding', () => {
     expect(
       sanitizeAgentReply('● Actual reply text                         \n  - keep markdown bullet      '),
@@ -1896,7 +1978,7 @@ describe('thread_router forwardMessage', () => {
     expect(sanitizeAgentReply('First\n\n\n\nSecond\n\n\nThird')).toBe('First\n\nSecond\n\nThird')
   })
 
-  test('sanitizeAgentReply strips live Slack echo and context usage artifacts', () => {
+  test('sanitizeAgentReply strips live Slack echo while preserving context usage lines', () => {
     expect(
       sanitizeAgentReply(
         [
@@ -1913,6 +1995,7 @@ describe('thread_router forwardMessage', () => {
       ),
     ).toBe(
       [
+        '10% context used',
         'I can see the attachment and will review it.',
         '  - Keep markdown bullet indentation',
         '```text',
@@ -1997,7 +2080,7 @@ describe('thread_router forwardMessage', () => {
     })
   })
 
-  test('preserves forwarded metadata with attachment paths and sanitizes agent reply', async () => {
+  test('preserves forwarded attachment paths without repeating Slack startup context', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fetchMock = async (url: string, init?: RequestInit) => {
       calls.push({ url, init })
@@ -2036,6 +2119,7 @@ describe('thread_router forwardMessage', () => {
       'hello',
       {
         fetch: fetchMock,
+        includeSlackContext: false,
         statusPollMs: 1,
       },
       {
@@ -2053,13 +2137,7 @@ describe('thread_router forwardMessage', () => {
     expect(reply).toBe('attached response')
     const posted = JSON.parse(String(calls[0]!.init?.body))
     expect(posted.type).toBe('user')
-    expect(posted.content).toContain(
-      '<slack_context channel_id="C123" thread_ts="1800000000.000001" ts="1800000000.000002" user="casey" user_id="U123" message_id="1800000000.000002" attachment_count="2" attachment_paths="/tmp/a.txt; /tmp/b.txt">',
-    )
-    expect(posted.content).toContain('You are replying in this Slack thread')
-    expect(posted.content).toContain('Answer concisely for Slack')
-    expect(posted.content).toContain('inspect those local files with Read/Bash')
-    expect(posted.content).toContain('say what to fetch instead of assuming')
+    expect(posted.content).not.toContain('<slack_context ')
     expect(posted.content).toContain(
       '<channel source="slack" chat_id="C123" thread_ts="1800000000.000001" ts="1800000000.000002" message_id="1800000000.000002" user="casey" user_id="U123" attachment_count="2" attachment_paths="/tmp/a.txt; /tmp/b.txt">\nhello\n</channel>',
     )
