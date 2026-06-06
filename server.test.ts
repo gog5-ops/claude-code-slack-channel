@@ -2500,6 +2500,120 @@ describe('thread_router forwardMessage', () => {
     expect(calls.filter((path) => path === '/message')).toHaveLength(1)
   })
 
+  test('retries a transient not-ready POST past the old 5s window until the worker accepts it', async () => {
+    // Post-recycle race: a freshly spawned worker can take longer than the old
+    // 5s window to reach "waiting for user input". With the widened default
+    // window the transient 500s are retried until the worker accepts the message
+    // (opshub#155, Phase 5 follow-up). A fake clock drives the retry deadline so
+    // ~8s of simulated elapsed time is exercised without a slow test.
+    let clock = 0
+    let messageAttempts = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        messageAttempts += 1
+        clock += 2000 // advance 2s of simulated time per attempt
+        if (messageAttempts <= 3) {
+          return new Response(
+            JSON.stringify({
+              detail: 'failed to send message: message can only be sent when the agent is waiting for user input',
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { id: 1, role: 'agent', content: 'delivered after startup race', time: '2026-06-06T00:00:01.000Z' },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      now: () => clock,
+    })
+
+    expect(reply).toContain('delivered after startup race')
+    // Succeeded only on the 4th attempt, at ~8s simulated — well past the old 5s.
+    expect(messageAttempts).toBe(4)
+  })
+
+  test('still gives up when the not-ready POST exceeds the configured retry window', async () => {
+    // The retry stays bounded: with a 5s window (the old default), the same >5s
+    // race exhausts and propagates (so deliverToSession can finalize the
+    // placeholder) instead of retrying forever (opshub#155, Phase 5 follow-up).
+    let clock = 0
+    let messageAttempts = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        messageAttempts += 1
+        clock += 2000
+        if (messageAttempts <= 3) {
+          return new Response(
+            JSON.stringify({
+              detail: 'failed to send message: message can only be sent when the agent is waiting for user input',
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(JSON.stringify({ messages: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    let threw: unknown
+    try {
+      await forwardMessage(3099, 'hello', {
+        fetch: fetchMock,
+        statusPollMs: 1,
+        messageSettleMs: 0,
+        messagePostRetryMs: 5_000,
+        now: () => clock,
+      })
+    } catch (err) {
+      threw = err
+    }
+
+    expect(threw).toBeInstanceOf(Error)
+    expect((threw as Error).message).toMatch(/agentapi request failed/)
+    // Bounded at 5s: gave up on the 3rd attempt (~6s simulated), never reaching
+    // the 4th attempt that would have succeeded.
+    expect(messageAttempts).toBe(3)
+  })
+
   test('falls back to Claude project JSONL when AgentAPI messages are context-only', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-jsonl-fallback-'))
     const cwd = join(rawRoot, 'repo')

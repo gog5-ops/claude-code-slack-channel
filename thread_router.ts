@@ -56,6 +56,7 @@ export interface ThreadRouterOptions {
   statusPollMs?: number
   forwardTimeoutMs?: number
   messageSettleMs?: number
+  messagePostRetryMs?: number
   includeSlackContext?: boolean
   claudeProjectsDir?: string
   heartbeatMs?: number
@@ -92,7 +93,12 @@ const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
 const DEFAULT_MESSAGE_SETTLE_MS = 750
 const DEFAULT_HEARTBEAT_MS = 30_000
 const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
-const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 5_000
+// Window for retrying the transient "agent is not waiting for user input" POST
+// race after a worker spawn/recycle. A freshly spawned Claude worker can take
+// tens of seconds to load context/MCP before it reaches the input prompt, so
+// this matches the activation-timeout magnitude rather than the old 5s, which
+// was too short post-recycle (opshub#155, Phase 5 follow-up).
+const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 30_000
 const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
 const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
@@ -1209,13 +1215,21 @@ async function fetchJson<T>(
   return await response.json() as T
 }
 
+// agentapi itself gates POST /message on the agent being ready for input (it
+// returns the "waiting for user input" 500 otherwise), so that gate — not a
+// /status read — is the authoritative readiness signal. (/status `stable` flips
+// transiently and is an unreliable proxy; see waitForSettledAgentMessageContent.)
+// We therefore wait for readiness by retrying the POST against agentapi's own
+// gate, bounded by messagePostRetryMs (opshub#155, Phase 5 follow-up).
 async function postAgentMessageWithRetry<T>(
   fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
   url: string,
   init: RequestInit,
   options: ThreadRouterOptions,
 ): Promise<T> {
-  const deadline = Date.now() + DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS
+  const now = options.now || Date.now
+  const retryMs = Math.max(0, options.messagePostRetryMs ?? DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS)
+  const deadline = now() + retryMs
   const pollMs = Math.max(
     1,
     Math.min(options.statusPollMs || DEFAULT_MESSAGE_POST_RETRY_POLL_MS, DEFAULT_MESSAGE_POST_RETRY_POLL_MS),
@@ -1230,7 +1244,7 @@ async function postAgentMessageWithRetry<T>(
 
     const isTransientStartupRace =
       response.status === 500 && AGENT_WAITING_FOR_USER_INPUT_RE.test(rawBody)
-    const remainingMs = deadline - Date.now()
+    const remainingMs = deadline - now()
     if (!isTransientStartupRace || remainingMs <= 0) {
       const detail = rawBody.trim() ? `: ${rawBody.trim()}` : ''
       throw new Error(`agentapi request failed: ${response.status} ${response.statusText}${detail}`)
