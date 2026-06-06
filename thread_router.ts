@@ -495,24 +495,43 @@ async function waitForSettledAgentMessageContent(
     1,
     Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, DEFAULT_MESSAGE_SETTLE_POLL_MS),
   )
-  const deadline = Date.now() + settleMs
+  // Overall ceiling so a worker that resumes and never settles can't wedge the
+  // forward; reuses waitForStable's bound (opshub#155, Phase 5 follow-up).
+  const overallDeadline = Date.now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
+  let settleDeadline = Date.now() + settleMs
   let previousContent: string | undefined
   let latestContent: string | undefined
   let hasPrevious = false
 
   while (true) {
     latestContent = await fetchLatestAgentMessageContent(port, options)
-    if (
+    // A worker that is still running can post mid-turn content during tool-call
+    // pauses; unchanged content must not settle while it is busy, or the reply
+    // gets truncated. Only count the settle window once status is stable.
+    const running = (await getAgentStatus(port, options)) === 'running'
+
+    if (running) {
+      // Provisional mid-turn content: drop the unchanged-content tracking and
+      // restart the settle window so a pause cannot post a partial reply.
+      previousContent = undefined
+      hasPrevious = false
+      settleDeadline = Date.now() + settleMs
+    } else if (
       latestContent !== undefined &&
       hasPrevious &&
       latestContent === previousContent
-    ) return latestContent
-    previousContent = latestContent
-    hasPrevious = true
+    ) {
+      return latestContent
+    } else {
+      previousContent = latestContent
+      hasPrevious = true
+    }
 
-    const remainingMs = deadline - Date.now()
-    if (settleMs === 0 || remainingMs <= 0) return latestContent || ''
-    await sleep(Math.min(pollMs, remainingMs))
+    const now = Date.now()
+    if (now >= overallDeadline) return latestContent || ''
+    if (!running && (settleMs === 0 || now >= settleDeadline)) return latestContent || ''
+    const cap = running ? overallDeadline : settleDeadline
+    await sleep(Math.min(pollMs, Math.max(1, cap - now)))
   }
 }
 
