@@ -2704,6 +2704,62 @@ describe('thread_router forwardMessage', () => {
     expect(reply).not.toBe('12% context used')
   })
 
+  test('re-polls /messages and recovers when it settles to a short header plus context footer', async () => {
+    // Live opshub#155 signature after fcc362d: /messages initially stabilized at
+    // `Topview 生成 skill 共 4 个：\n\n12% context used`, then a later /messages
+    // snapshot contained the full numbered list. A header+context footer is not
+    // context-only, so this exercises the additional incomplete-prefix detection.
+    const headerOnly = 'Topview 生成 skill 共 4 个：\n\n12% context used'
+    const full = [
+      'Topview 生成 skill 共 4 个：',
+      '',
+      '1) topview-skill — 生成 Topview skill',
+      '2) topview2api — API bridge',
+      '3) deep-research — research workflow',
+      '4) drama-studio — prompt regeneration',
+      '',
+      '12% context used',
+    ].join('\n')
+    let messagesCalls = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        messagesCalls += 1
+        const content = messagesCalls <= 1 ? headerOnly : full
+        return new Response(
+          JSON.stringify({
+            messages: [{ id: 1, role: 'agent', content, time: '2026-06-06T00:00:01.000Z' }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 0,
+    })
+
+    expect(reply).toBe(full)
+    expect(reply).toContain('1) topview-skill')
+    expect(reply).toContain('4) drama-studio')
+    expect(reply).not.toBe(headerOnly)
+    expect(messagesCalls).toBeGreaterThan(1)
+  })
+
   test('re-poll for an empty/context-only reply is bounded and falls through', async () => {
     // If /messages never yields a real reply, the re-poll must give up within its
     // budget (no hang) and fall through to the existing fallback — here, with no

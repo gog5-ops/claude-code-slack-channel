@@ -334,12 +334,13 @@ export async function forwardMessage(
   let sanitized = sanitizeAgentReply(content)
 
   // Post-settle flush race: status can report stable while agentapi /messages is
-  // momentarily empty/context-only before the final assistant text lands. Rather
-  // than immediately fall back to a possibly-partial JSONL (which delivered a
-  // header-only "header\n\nN% context used"), re-poll /messages briefly for the
-  // real reply. Startup-artifact screens aren't empty/context-only, so they skip
-  // this and keep their JSONL-fallback handling (opshub#155, Phase 5 follow-up).
-  if (replyNeedsJsonlFallback(sanitized) && !replyIsStartupArtifact(sanitized)) {
+  // momentarily empty/context-only, or only a short header plus context footer,
+  // before the final assistant text lands. Rather than immediately returning a
+  // header-only "header\n\nN% context used" (the live opshub#155 signature),
+  // re-poll /messages briefly for the real reply. Startup-artifact screens keep
+  // their JSONL-fallback handling.
+  const needsMessageRepoll = replyNeedsMessageRepoll(sanitized)
+  if (needsMessageRepoll && !replyIsStartupArtifact(sanitized)) {
     const recovered = await repollMeaningfulAgentReply(port, options)
     if (recovered !== undefined) {
       content = recovered
@@ -354,7 +355,9 @@ export async function forwardMessage(
   // the session JSONL, which is keyed to the posted message. Only when we have a
   // JSONL to fall back to, so a startup false-positive can never drop a reply.
   const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
-  if (!replyNeedsJsonlFallback(sanitized) && !isStartupArtifact) return sanitized
+  if (!replyNeedsJsonlFallback(sanitized) && !replyLooksHeaderOnlyWithContext(sanitized) && !isStartupArtifact) {
+    return sanitized
+  }
 
   const jsonlContent = jsonlFallbackState
     ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
@@ -411,6 +414,27 @@ function replyNeedsJsonlFallback(reply: string): boolean {
   const trimmed = reply.trim()
   if (!trimmed) return true
   return trimmed.split('\n').every((line) => CONTEXT_USAGE_RE.test(line.trim()))
+}
+
+function replyNeedsMessageRepoll(reply: string): boolean {
+  return replyNeedsJsonlFallback(reply) || replyLooksHeaderOnlyWithContext(reply)
+}
+
+function replyLooksHeaderOnlyWithContext(reply: string): boolean {
+  const trimmed = reply.trim()
+  if (!trimmed) return false
+
+  const lines = trimmed.split('\n').map((line) => line.trim()).filter(Boolean)
+  if (!lines.some((line) => CONTEXT_USAGE_RE.test(line))) return false
+
+  const substantive = lines.filter((line) => !CONTEXT_USAGE_RE.test(line))
+  if (substantive.length !== 1) return false
+
+  const [header] = substantive
+  // Keep this generic: a lone short non-context line followed by a context footer
+  // is likely a prefix/header flush, while a long paragraph + context footer is a
+  // valid concise answer and should not wait or fall back.
+  return header.length <= 120 && trimmed.length <= 180
 }
 
 export function replyIsStartupArtifact(content: string): boolean {
@@ -606,7 +630,7 @@ async function repollMeaningfulAgentReply(
     const content = await fetchLatestAgentMessageContent(port, options)
     if (content === undefined) continue
     const sanitized = sanitizeAgentReply(content)
-    if (!replyNeedsJsonlFallback(sanitized) && !replyIsStartupArtifact(sanitized)) {
+    if (!replyNeedsMessageRepoll(sanitized) && !replyIsStartupArtifact(sanitized)) {
       return content
     }
   }
