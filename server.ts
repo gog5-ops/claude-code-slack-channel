@@ -67,7 +67,7 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const THREAD_REGISTRY_FILE = join(STATE_DIR, 'thread_sessions.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const DEFAULT_CHUNK_LIMIT = 4000
+const DEFAULT_CHUNK_LIMIT = 20000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
 // reply tool may attach files. Colon-separated absolute paths. Default empty

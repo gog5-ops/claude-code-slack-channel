@@ -837,6 +837,11 @@ describe('outbound gate coverage for read/edit/react/download', () => {
 // ---------------------------------------------------------------------------
 
 describe('chunkText', () => {
+  test('server production default chunk limit is 20000', () => {
+    const serverSource = readFileSync(join(process.cwd(), 'server.ts'), 'utf8')
+    expect(serverSource).toContain('const DEFAULT_CHUNK_LIMIT = 20000')
+  })
+
   test('returns single chunk for short text', () => {
     const result = chunkText('hello', 4000, 'newline')
     expect(result).toEqual(['hello'])
