@@ -638,6 +638,8 @@ async function repollMeaningfulAgentReply(
 }
 
 export function sanitizeAgentReply(content: string): string {
+  content = scopeToLatestSlackInboundEcho(content)
+
   const sanitizedLines: string[] = []
   let inFence = false
   let fenceMarker = ''
@@ -704,6 +706,71 @@ export function sanitizeAgentReply(content: string): string {
   }
 
   return sanitizedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function scopeToLatestSlackInboundEcho(content: string): string {
+  const lines = content.replace(/\r\n?/g, '\n').split('\n')
+  let latestEchoIndex = -1
+  let inFence = false
+  let fenceMarker = ''
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmedStart = line.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+
+    if (inFence) {
+      if (fence && fence[0] === fenceMarker[0] && fence.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+      continue
+    }
+
+    if (fence) {
+      inFence = true
+      fenceMarker = fence
+      continue
+    }
+
+    if (SLACK_INBOUND_ECHO_RE.test(line.replace(TUI_PREFIX_RE, '').trim())) {
+      latestEchoIndex = index
+    }
+  }
+
+  if (latestEchoIndex < 0) return content
+
+  const afterEcho = latestEchoIndex + 1
+  const blankAfterEchoIndex = lines.findIndex((rawLine, index) => {
+    if (index < afterEcho) return false
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    return !line.replace(TUI_PREFIX_RE, '').trim()
+  })
+
+  if (blankAfterEchoIndex > afterEcho && blankAfterEchoIndex - afterEcho >= 2) {
+    const beforeBlankLooksLikeEchoContinuation = lines.slice(afterEcho, blankAfterEchoIndex).every((rawLine) => {
+      const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+      const trimmed = line.replace(TUI_PREFIX_RE, '').trim()
+      return Boolean(trimmed) && !TUI_PREFIX_RE.test(line) && !CONTEXT_USAGE_RE.test(trimmed)
+    })
+    if (beforeBlankLooksLikeEchoContinuation) {
+      return lines.slice(blankAfterEchoIndex + 1).join('\n')
+    }
+  }
+
+  let start = afterEcho
+  while (start < lines.length) {
+    const line = lines[start]!.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmed = line.replace(TUI_PREFIX_RE, '').trim()
+    if (!trimmed) {
+      start += 1
+      break
+    }
+    if (!SLACK_ECHO_CONTINUATION_RE.test(trimmed)) break
+    start += 1
+  }
+
+  return lines.slice(start).join('\n')
 }
 
 function normalizeReplyLine(line: string): string {

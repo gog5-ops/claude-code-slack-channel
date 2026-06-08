@@ -2235,6 +2235,39 @@ describe('thread_router forwardMessage', () => {
     ).toBe('Actual reply text\n  - keep markdown bullet')
   })
 
+  test('sanitizeAgentReply scopes TUI scrollback to the latest Slack echo', () => {
+    const raw = [
+      '● Old answer that should not leak into Slack',
+      '← slack · opshub: old user prompt',
+      '',
+      '● Another stale answer from scrollback',
+      '← slack · opshub: current user prompt asking for the real answer',
+      '',
+      '● Current answer only',
+      '                                                               19% context used',
+    ].join('\n')
+
+    const reply = sanitizeAgentReply(raw)
+
+    expect(reply).toBe('Current answer only\n19% context used')
+    expect(reply).not.toContain('Old answer')
+    expect(reply).not.toContain('old user prompt')
+  })
+
+  test('sanitizeAgentReply leaves normal assistant replies unchanged', () => {
+    const raw = [
+      'Current answer only',
+      '',
+      '- keep markdown bullet',
+      '',
+      '```text',
+      'raw       terminal spacing',
+      '```',
+    ].join('\n')
+
+    expect(sanitizeAgentReply(raw)).toBe(raw)
+  })
+
   test('sanitizeAgentReply strips tool and timed status lines outside code fences', () => {
     expect(
       sanitizeAgentReply(
@@ -2326,6 +2359,20 @@ describe('thread_router forwardMessage', () => {
         ].join('\n'),
       ),
     ).toBe('SLACK_SMOKE_OK attachment_count=1')
+  })
+
+  test('sanitizeAgentReply drops non-ellipsis Slack echo wrapped lines through blank', () => {
+    expect(
+      sanitizeAgentReply(
+        [
+          '← slack · opshub: Please answer this long Slack message that wrapped in the TUI',
+          'with a continuation line that does not end in an ellipsis marker',
+          'and another continuation line before the blank separator',
+          '',
+          '● Current answer after wrapped echo',
+        ].join('\n'),
+      ),
+    ).toBe('Current answer after wrapped echo')
   })
 
   test('sanitizeAgentReply preserves an indented numbered list (not just header + context)', () => {
@@ -2426,6 +2473,58 @@ describe('thread_router forwardMessage', () => {
       content: 'hello',
       type: 'user',
     })
+  })
+
+  test('forwardMessage scopes AgentAPI TUI scrollback to the current Slack turn', async () => {
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/message')) {
+        expect(init?.method).toBe('POST')
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                id: 10,
+                role: 'agent',
+                content: [
+                  '● Old answer from the Claude TUI scrollback',
+                  '← slack · opshub: old user prompt that must not be delivered',
+                  '',
+                  '● More stale assistant content',
+                  '← slack · opshub: latest user prompt',
+                  '',
+                  '● Current answer for the latest Slack turn',
+                ].join('\n'),
+                time: '2026-06-06T00:00:01.000Z',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'latest user prompt', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 0,
+    })
+
+    expect(reply).toBe('Current answer for the latest Slack turn')
+    expect(reply).not.toContain('Old answer')
+    expect(reply).not.toContain('old user prompt')
   })
 
   test('retries transient startup POST /message waiting-for-user-input error', async () => {
