@@ -107,7 +107,7 @@ const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
 // stable status; re-polling recovers the real reply instead of falling back to a
 // possibly-partial JSONL (opshub#155, Phase 5 follow-up).
 const DEFAULT_REPLY_REPOLL_MS = 3_000
-const DEFAULT_CLAUDE_MODEL = 'claude-opus-4-8'
+const DEFAULT_CLAUDE_MODEL = 'claude-opus-4-6'
 const DEFAULT_CLAUDE_FALLBACK_MODEL = 'claude-opus-4-8'
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
 const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g

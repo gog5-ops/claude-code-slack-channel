@@ -1931,7 +1931,7 @@ describe('thread_router agentapi command', () => {
     })
 
     expect(args).toContain('--model')
-    expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-4-8')
+    expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-4-6')
     expect(args).toContain('--effort')
     expect(args[args.indexOf('--effort') + 1]).toBe('max')
     expect(args).toContain('--allowedTools')
@@ -2069,7 +2069,7 @@ describe('thread_router ensureSession', () => {
   test('falls back to claude-opus-4-8 when the primary model has no provider', async () => {
     const oldModel = process.env['SLACK_THREAD_CLAUDE_MODEL']
     const oldFallback = process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL']
-    process.env['SLACK_THREAD_CLAUDE_MODEL'] = 'claude-opus-4-6[1m]'
+    process.env['SLACK_THREAD_CLAUDE_MODEL'] = 'claude-opus-4-6'
     process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL'] = 'claude-opus-4-8'
     try {
       const key = buildSessionKey('C_FALLBACK', '1700000000.000100')
@@ -2086,7 +2086,7 @@ describe('thread_router ensureSession', () => {
           return { pid: 6000 + spawnedModels.length, unref: () => {} }
         },
         fetch: async () => {
-          if (spawnedModels.at(-1) === 'claude-opus-4-6[1m]') {
+          if (spawnedModels.at(-1) === 'claude-opus-4-6') {
             mkdirSync(dirname(stateFilePathForKey(tmpRoot, key)), { recursive: true })
             writeFileSync(stateFilePathForKey(tmpRoot, key), JSON.stringify({
               version: 1,
@@ -2110,7 +2110,7 @@ describe('thread_router ensureSession', () => {
 
       expect(session.status).toBe('active')
       expect(session.pid).toBe(6002)
-      expect(spawnedModels).toEqual(['claude-opus-4-6[1m]', 'claude-opus-4-8'])
+      expect(spawnedModels).toEqual(['claude-opus-4-6', 'claude-opus-4-8'])
       expect(existsSync(stateFilePathForKey(tmpRoot, key))).toBe(false)
     } finally {
       if (oldModel === undefined) delete process.env['SLACK_THREAD_CLAUDE_MODEL']
