@@ -1931,13 +1931,30 @@ describe('thread_router agentapi command', () => {
     })
 
     expect(args).toContain('--model')
-    expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-4-6[1m]')
+    expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-4-8')
     expect(args).toContain('--effort')
     expect(args[args.indexOf('--effort') + 1]).toBe('max')
     expect(args).toContain('--allowedTools')
     expect(args[args.indexOf('--allowedTools') + 1]).toBe('Read Edit Write Bash')
     expect(args).not.toContain('server:slack')
     expect(args).not.toContain('--dangerously-load-development-channels')
+  })
+
+  test('allows the thread Claude model to be overridden by env', () => {
+    const oldModel = process.env['SLACK_THREAD_CLAUDE_MODEL']
+    process.env['SLACK_THREAD_CLAUDE_MODEL'] = 'claude-opus-test'
+    try {
+      const key = buildSessionKey('C_CMD', '1700000000.000500')
+      const { args } = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+        cwd: tmpRoot,
+        claudeProjectsDir,
+      })
+
+      expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-test')
+    } finally {
+      if (oldModel === undefined) delete process.env['SLACK_THREAD_CLAUDE_MODEL']
+      else process.env['SLACK_THREAD_CLAUDE_MODEL'] = oldModel
+    }
   })
 })
 
@@ -2047,6 +2064,60 @@ describe('thread_router ensureSession', () => {
     expect(session.pid).toBe(5678)
     expect(spawnCalls).toHaveLength(1)
     expect(existsSync(stateFilePathForKey(tmpRoot, key))).toBe(false)
+  })
+
+  test('falls back to claude-opus-4-8 when the primary model has no provider', async () => {
+    const oldModel = process.env['SLACK_THREAD_CLAUDE_MODEL']
+    const oldFallback = process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL']
+    process.env['SLACK_THREAD_CLAUDE_MODEL'] = 'claude-opus-4-6[1m]'
+    process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL'] = 'claude-opus-4-8'
+    try {
+      const key = buildSessionKey('C_FALLBACK', '1700000000.000100')
+      const spawnedModels: string[] = []
+
+      const session = await ensureSession('C_FALLBACK', '1700000000.000100', {
+        stateDir: tmpRoot,
+        cwd: tmpRoot,
+        activationTimeoutMs: 1,
+        statusPollMs: 1,
+        portIsAvailable: async () => true,
+        spawnAgent: (_command, args) => {
+          spawnedModels.push(args[args.indexOf('--model') + 1]!)
+          return { pid: 6000 + spawnedModels.length, unref: () => {} }
+        },
+        fetch: async () => {
+          if (spawnedModels.at(-1) === 'claude-opus-4-6[1m]') {
+            mkdirSync(dirname(stateFilePathForKey(tmpRoot, key)), { recursive: true })
+            writeFileSync(stateFilePathForKey(tmpRoot, key), JSON.stringify({
+              version: 1,
+              messages: [{
+                id: 0,
+                message: 'API Error: 502 unknown provider for model claude-opus-4-6',
+                role: 'agent',
+                time: new Date().toISOString(),
+              }],
+              initial_prompt: '',
+              initial_prompt_sent: false,
+            }))
+            return new Response('not ready', { status: 503 })
+          }
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        },
+      })
+
+      expect(session.status).toBe('active')
+      expect(session.pid).toBe(6002)
+      expect(spawnedModels).toEqual(['claude-opus-4-6[1m]', 'claude-opus-4-8'])
+      expect(existsSync(stateFilePathForKey(tmpRoot, key))).toBe(false)
+    } finally {
+      if (oldModel === undefined) delete process.env['SLACK_THREAD_CLAUDE_MODEL']
+      else process.env['SLACK_THREAD_CLAUDE_MODEL'] = oldModel
+      if (oldFallback === undefined) delete process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL']
+      else process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL'] = oldFallback
+    }
   })
 })
 

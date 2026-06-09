@@ -36,6 +36,7 @@ export interface BuildAgentapiCommandOptions {
   cwd?: string
   claudeProjectsDir?: string
   sessionJsonlExists?: (path: string) => boolean
+  model?: string
 }
 
 export interface ThreadRouterOptions {
@@ -106,6 +107,8 @@ const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
 // stable status; re-polling recovers the real reply instead of falling back to a
 // possibly-partial JSONL (opshub#155, Phase 5 follow-up).
 const DEFAULT_REPLY_REPOLL_MS = 3_000
+const DEFAULT_CLAUDE_MODEL = 'claude-opus-4-8'
+const DEFAULT_CLAUDE_FALLBACK_MODEL = 'claude-opus-4-8'
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
 const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
@@ -127,6 +130,7 @@ const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?)
 const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
 const CLAUDE_PROJECT_SAFE_CHAR_RE = /[^A-Za-z0-9_-]/g
 const CLAUDE_SESSION_ALREADY_IN_USE_RE = /Error:\s+Session ID [0-9a-f-]+ is already in use\./i
+const CLAUDE_UNKNOWN_PROVIDER_RE = /unknown provider for model\s+\S+/i
 const AGENT_WAITING_FOR_USER_INPUT_RE = /message can only be sent when the agent is waiting for user input/i
 // Signatures of the Claude startup / setup / context-index TUI screen that a
 // fresh worker shows before it has replied to the just-posted message. These
@@ -200,6 +204,7 @@ export function buildAgentapiCommand(
 ): { command: string; args: string[]; stateFile: string; claudeSessionId: string } {
   const stateFile = stateFilePathForKey(stateDir, key)
   const claudeSessionId = claudeSessionIdForKey(key)
+  const model = options.model || threadClaudeModel()
   const sessionJsonl = claudeProjectSessionJsonlPath(
     options.cwd || process.cwd(),
     claudeSessionId,
@@ -228,7 +233,7 @@ export function buildAgentapiCommand(
       '--name',
       key,
       '--model',
-      'claude-opus-4-6[1m]',
+      model,
       '--effort',
       'max',
       '--allowedTools',
@@ -237,6 +242,14 @@ export function buildAgentapiCommand(
     stateFile,
     claudeSessionId,
   }
+}
+
+export function threadClaudeModel(): string {
+  return process.env['SLACK_THREAD_CLAUDE_MODEL'] || DEFAULT_CLAUDE_MODEL
+}
+
+export function threadClaudeFallbackModel(): string {
+  return process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL'] || DEFAULT_CLAUDE_FALLBACK_MODEL
 }
 
 export async function readRegistryFile(path: string): Promise<ThreadSessionRegistry> {
@@ -980,31 +993,59 @@ async function activateSession(
     return waitForActivation(key, options, stateDir)
   }
 
+  const primaryModel = threadClaudeModel()
+  const fallbackModel = threadClaudeFallbackModel()
+  const models = fallbackModel && fallbackModel !== primaryModel
+    ? [primaryModel, fallbackModel]
+    : [primaryModel]
+
+  let lastErr: unknown
+  for (const [index, model] of models.entries()) {
+    try {
+      const pid = await spawnThreadAgent(claim.port, key, stateDir, options, model)
+      return markActive(key, claim, pid, options, stateDir)
+    } catch (err) {
+      lastErr = err
+      const canFallback = index === 0 && models.length > 1 && await hasUnknownProviderStartupStateFile(stateDir, key)
+      if (!canFallback) {
+        await markDeadIfCurrent(key, claim, options, stateDir)
+        throw err
+      }
+      console.error(`[slack] thread worker model ${model} unavailable; retrying with ${models[1]}`)
+      await unlinkFatalStartupStateFile(stateDir, key)
+    }
+  }
+
+  await markDeadIfCurrent(key, claim, options, stateDir)
+  throw lastErr instanceof Error ? lastErr : new Error('Failed to activate thread session')
+}
+
+async function spawnThreadAgent(
+  port: number,
+  key: string,
+  stateDir: string,
+  options: ThreadRouterOptions,
+  model: string,
+): Promise<number> {
   const cwd = options.cwd || process.cwd()
   const agentapiPath = options.agentapiPath || join(homedir(), 'bin', 'agentapi')
-  const { command, args } = buildAgentapiCommand(claim.port, key, stateDir, agentapiPath, { cwd })
+  const { command, args } = buildAgentapiCommand(port, key, stateDir, agentapiPath, { cwd, model })
   const spawnAgent = options.spawnAgent || defaultSpawnAgent
 
-  try {
-    await mkdir(join(stateDir, 'sessions'), { recursive: true, mode: 0o700 })
-    await unlinkFatalStartupStateFile(stateDir, key)
-    const child = spawnAgent(command, args, {
-      cwd,
-      detached: true,
-      stdio: 'ignore',
-      env: {
-        ...process.env,
-        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '0.80',
-      },
-    })
-    child.unref?.()
-    const pid = child.pid || 0
-    await waitForAgentHealthy(claim.port, options, key, stateDir)
-    return markActive(key, claim, pid, options, stateDir)
-  } catch (err) {
-    await markDeadIfCurrent(key, claim, options, stateDir)
-    throw err
-  }
+  await mkdir(join(stateDir, 'sessions'), { recursive: true, mode: 0o700 })
+  await unlinkFatalStartupStateFile(stateDir, key)
+  const child = spawnAgent(command, args, {
+    cwd,
+    detached: true,
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '0.80',
+    },
+  })
+  child.unref?.()
+  await waitForAgentHealthy(port, options, key, stateDir)
+  return child.pid || 0
 }
 
 async function claimActivation(
@@ -1137,10 +1178,10 @@ async function waitForAgentHealthy(
   const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
 
   while (Date.now() <= deadline) {
-    if (
-      await isAgentHealthy(port, options) &&
-      (!key || !stateDir || !await hasFatalStartupStateFile(stateDir, key))
-    ) return
+    if (key && stateDir && await hasFatalStartupStateFile(stateDir, key)) {
+      throw new Error(`Fatal Claude startup state for thread session: ${key}`)
+    }
+    if (await isAgentHealthy(port, options)) return
     await sleep(pollMs)
   }
 
@@ -1256,7 +1297,36 @@ async function hasFatalStartupStateFile(stateDir: string, key: string): Promise<
         typeof message === 'object' &&
         (message as { role?: unknown }).role === 'agent' &&
         typeof (message as { message?: unknown }).message === 'string' &&
-        CLAUDE_SESSION_ALREADY_IN_USE_RE.test((message as { message: string }).message),
+        (
+          CLAUDE_SESSION_ALREADY_IN_USE_RE.test((message as { message: string }).message) ||
+          CLAUDE_UNKNOWN_PROVIDER_RE.test((message as { message: string }).message)
+        ),
+      ),
+    )
+  } catch {
+    return false
+  }
+}
+
+async function hasUnknownProviderStartupStateFile(stateDir: string, key: string): Promise<boolean> {
+  const path = stateFilePathForKey(stateDir, key)
+  try {
+    const raw = await readFile(path, 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return false
+    const messages = (parsed as { messages?: unknown }).messages
+    if (!Array.isArray(messages) || messages.length === 0) return false
+    const hasUserMessage = messages.some((message) =>
+      Boolean(message && typeof message === 'object' && (message as { role?: unknown }).role === 'user'),
+    )
+    if (hasUserMessage) return false
+    return messages.some((message) =>
+      Boolean(
+        message &&
+        typeof message === 'object' &&
+        (message as { role?: unknown }).role === 'agent' &&
+        typeof (message as { message?: unknown }).message === 'string' &&
+        CLAUDE_UNKNOWN_PROVIDER_RE.test((message as { message: string }).message),
       ),
     )
   } catch {
