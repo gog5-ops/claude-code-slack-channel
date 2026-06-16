@@ -44,15 +44,18 @@ import {
   ensureSession,
   formatForwardedMessage,
   forwardMessage,
+  isNotWaitingForUserInputError,
   readRegistry,
   reapFakeActiveSessions,
   registryFilePath,
   replyIsStartupArtifact,
   replyLooksLikeHtmlIntermediate,
+  runDeliveryDrainLoop,
   sanitizeAgentReply,
   sessionKeyFromMeta,
   stateFilePathForKey,
   writeRegistry,
+  type QueuedTurn,
   type SpawnAgent,
   type ThreadSessionRegistry,
 } from './thread_router.ts'
@@ -4926,5 +4929,185 @@ describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
       rule('r2', 'auto_approve', { tool: 'upload_file' }),
     ]
     expect(checkMonotonicity([], next)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Delivery queue (opshub#155)
+// ---------------------------------------------------------------------------
+
+function makeTurn(text: string, overrides: Partial<QueuedTurn> = {}): QueuedTurn {
+  return {
+    text,
+    meta: { chat_id: 'C1', thread_ts: '1.0' },
+    progressTs: undefined,
+    enqueuedAt: 0,
+    ...overrides,
+  }
+}
+
+describe('isNotWaitingForUserInputError', () => {
+  test('detects the transient agentapi 500 body', () => {
+    const err = new Error(
+      'agentapi request failed: 500 Internal Server Error: message can only be sent when the agent is waiting for user input',
+    )
+    expect(isNotWaitingForUserInputError(err)).toBe(true)
+  })
+
+  test('does not match a generic 500', () => {
+    expect(isNotWaitingForUserInputError(new Error('agentapi request failed: 500 internal server error'))).toBe(false)
+  })
+
+  test('handles non-Error values', () => {
+    expect(isNotWaitingForUserInputError(null)).toBe(false)
+    expect(isNotWaitingForUserInputError('random string')).toBe(false)
+  })
+})
+
+describe('runDeliveryDrainLoop', () => {
+  // Helper: simple mutable queue backed by an array.
+  function makeQueue(initial: QueuedTurn[] = []) {
+    const q = [...initial]
+    return {
+      getQueue: () => q,
+      setQueue: (updated: QueuedTurn[]) => { q.length = 0; q.push(...updated) },
+    }
+  }
+
+  test('queues turn; drains and delivers when worker becomes ready', async () => {
+    const { getQueue, setQueue } = makeQueue([makeTurn('hello', { progressTs: 'p1' })])
+    const delivered: QueuedTurn[] = []
+    const failed: QueuedTurn[] = []
+    let attempt = 0
+
+    await runDeliveryDrainLoop({
+      getQueue,
+      setQueue,
+      attemptTurn: async (turn) => {
+        attempt++
+        if (attempt < 3) return 'transient'
+        delivered.push(turn)
+        return 'ok'
+      },
+      onFailRemaining: async (turns) => { failed.push(...turns) },
+      pollMs: 0,
+      ttlMs: 60_000,
+      drainTimeoutMs: 60_000,
+      sleep: async () => {},
+      now: () => 0,
+    })
+
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]!.text).toBe('hello')
+    expect(failed).toHaveLength(0)
+    expect(getQueue()).toHaveLength(0)
+  })
+
+  test('drains multiple queued turns FIFO without duplicates', async () => {
+    const { getQueue, setQueue } = makeQueue([
+      makeTurn('first'),
+      makeTurn('second'),
+      makeTurn('third'),
+    ])
+    const order: string[] = []
+
+    await runDeliveryDrainLoop({
+      getQueue,
+      setQueue,
+      attemptTurn: async (turn) => {
+        order.push(turn.text)
+        return 'ok'
+      },
+      onFailRemaining: async () => {},
+      pollMs: 0,
+      ttlMs: 60_000,
+      drainTimeoutMs: 60_000,
+      sleep: async () => {},
+      now: () => 0,
+    })
+
+    expect(order).toEqual(['first', 'second', 'third'])
+    expect(getQueue()).toHaveLength(0)
+  })
+
+  test('fatal error dequeues current turn and continues to drain next', async () => {
+    const { getQueue, setQueue } = makeQueue([
+      makeTurn('bad', { progressTs: 'p1' }),
+      makeTurn('good', { progressTs: 'p2' }),
+    ])
+    const delivered: string[] = []
+    const failed: QueuedTurn[] = []
+
+    await runDeliveryDrainLoop({
+      getQueue,
+      setQueue,
+      attemptTurn: async (turn) => {
+        if (turn.text === 'bad') return 'fatal'
+        delivered.push(turn.text)
+        return 'ok'
+      },
+      onFailRemaining: async (turns) => { failed.push(...turns) },
+      pollMs: 0,
+      ttlMs: 60_000,
+      drainTimeoutMs: 60_000,
+      sleep: async () => {},
+      now: () => 0,
+    })
+
+    expect(delivered).toEqual(['good'])
+    expect(failed).toHaveLength(0)
+    expect(getQueue()).toHaveLength(0)
+  })
+
+  test('drain timeout: remaining turns passed to onFailRemaining', async () => {
+    let clock = 0
+    const { getQueue, setQueue } = makeQueue([makeTurn('stuck', { progressTs: 'ps' })])
+    const failed: QueuedTurn[] = []
+
+    await runDeliveryDrainLoop({
+      getQueue,
+      setQueue,
+      attemptTurn: async () => {
+        clock += 2_000
+        return 'transient'
+      },
+      onFailRemaining: async (turns) => { failed.push(...turns) },
+      pollMs: 0,
+      ttlMs: 60_000,
+      drainTimeoutMs: 5_000,
+      sleep: async () => {},
+      now: () => clock,
+    })
+
+    expect(failed).toHaveLength(1)
+    expect(failed[0]!.text).toBe('stuck')
+    expect(getQueue()).toHaveLength(0)
+  })
+
+  test('expired turns are pruned before each attempt', async () => {
+    let clock = 0
+    const { getQueue, setQueue } = makeQueue([
+      makeTurn('fresh', { enqueuedAt: 0 }),
+      makeTurn('stale', { enqueuedAt: -61_000 }),  // already TTL-expired
+    ])
+    const delivered: string[] = []
+
+    await runDeliveryDrainLoop({
+      getQueue,
+      setQueue,
+      attemptTurn: async (turn) => {
+        delivered.push(turn.text)
+        return 'ok'
+      },
+      onFailRemaining: async () => {},
+      pollMs: 0,
+      ttlMs: 60_000,
+      drainTimeoutMs: 60_000,
+      sleep: async () => { clock += 10 },
+      now: () => clock,
+    })
+
+    expect(delivered).toEqual(['fresh'])
+    expect(getQueue()).toHaveLength(0)
   })
 })

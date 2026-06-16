@@ -53,7 +53,7 @@ import {
   type GateResult,
   type OutboundThreadRegistry,
 } from './lib.ts'
-import { buildHeartbeatMessage, claimSlackContextForSession, ensureSession, forwardMessage, type HeartbeatInfo } from './thread_router.ts'
+import { buildHeartbeatMessage, claimSlackContextForSession, ensureSession, forwardMessage, isNotWaitingForUserInputError, runDeliveryDrainLoop, type HeartbeatInfo, type QueuedTurn } from './thread_router.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -68,6 +68,13 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const THREAD_REGISTRY_FILE = join(STATE_DIR, 'thread_sessions.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DEFAULT_CHUNK_LIMIT = 20000
+// Per-thread delivery queue: max queued turns, per-turn TTL, and drain window.
+// Turns queued beyond QUEUE_MAX_LEN are failed immediately; turns still
+// undrainable after QUEUE_DRAIN_TIMEOUT_MS are failed via onFailRemaining.
+const QUEUE_MAX_LEN = 5
+const QUEUE_TTL_MS = 20 * 60_000
+const QUEUE_DRAIN_TIMEOUT_MS = 20 * 60_000
+const QUEUE_DRAIN_POLL_MS = 5_000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
 // reply tool may attach files. Colon-separated absolute paths. Default empty
@@ -287,6 +294,12 @@ const deliveredChannels = new Set<string>()
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
 const seenEvents = new Map<string, number>()
+
+// Per-thread delivery queues: turns that arrived while a worker was busy.
+// Keyed on `${chatId}:${threadTs}` (same as buildSessionKey). Drained FIFO
+// once the worker signals stable (opshub#155).
+const threadQueues = new Map<string, QueuedTurn[]>()
+const threadDraining = new Set<string>()
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -1010,21 +1023,17 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 // PERMISSION_REPLY_RE imported from lib.ts — shared with gate() for
 // peer-bot permission-reply blocking.
 
-async function deliverToSession(
+// Attempts to forward one turn to the per-thread worker. Returns:
+//   'ok'        — reply forwarded and sent to Slack
+//   'transient' — worker not ready ("not waiting for user input"); caller queues
+//   'fatal'     — other error; placeholder already updated to failure notice
+async function attemptDelivery(
   text: string,
   meta: Record<string, string>,
-  progressTs?: string,
-): Promise<void> {
+  progressTs: string | undefined,
+): Promise<'ok' | 'transient' | 'fatal'> {
   const chatId = meta.chat_id
   const threadTs = meta.thread_ts || meta.ts
-  if (!chatId || !threadTs) {
-    throw new Error('deliverToSession requires meta.chat_id and meta.thread_ts or meta.ts')
-  }
-
-  // A forward-phase failure (activation race, agentapi POST/forward error) leaves
-  // the "Working…" placeholder untouched — finalize it to a failure notice so the
-  // user isn't stranded forever. The transient "waiting for user input" POST race
-  // is already retried inside forwardMessage (opshub#155, Phase 5 follow-up).
   let port: number | undefined
   let replyText = ''
   try {
@@ -1032,9 +1041,7 @@ async function deliverToSession(
     port = session.port
     const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
     // While the worker is running, edit the progress message in place with a
-    // rate-limited heartbeat showing Claude Code's live status verb. The main
-    // router is the only Slack outbound sender; the thread session's own Slack
-    // MCP stays read-only.
+    // rate-limited heartbeat showing Claude Code's live status verb.
     const onHeartbeat = progressTs
       ? (info: HeartbeatInfo) => {
           web.chat.update({
@@ -1051,39 +1058,28 @@ async function deliverToSession(
       meta,
     )
   } catch (err) {
-    // Diagnostics (no secrets): "forward failed" plus the error message lets
-    // Hermes attribute the failure (agentapi POST vs activation); `port` is set
-    // only once a session was acquired.
     const detail = err instanceof Error ? err.message : String(err)
+    // Transient: worker busy with a prior turn — caller will queue and drain.
+    if (isNotWaitingForUserInputError(err)) return 'transient'
+    // Fatal: log + finalize placeholder so the user is not stranded.
     console.error(
       `[slack] deliverToSession forward failed key=${chatId}:${threadTs}${port ? ` port=${port}` : ''}: ${detail}`,
     )
-    // The placeholder is still "Working…" (no reply was produced); convert it to
-    // a concise failure notice so the user knows to resend.
     if (progressTs) {
       await web.chat
         .update({ channel: chatId, ts: progressTs, text: DELIVERY_FAILURE_NOTICE })
         .catch(() => {})
     }
-    return
+    return 'fatal'
   }
 
-  // Diagnostic (no secrets): record what we're about to deliver so a future
-  // Slack-vs-agentapi mismatch is attributable to before/after this point. The
-  // snippets are the bot's own reply head/tail with newlines escaped; on the
-  // observed truncation this logs a tiny len with a "header"/"context used"
-  // head/tail (opshub#155, Phase 5 follow-up).
+  // Diagnostic (no secrets): head/tail snippets of the reply for attribution.
   const replyHead = replyText.slice(0, 80).replace(/\n/g, '⏎')
   const replyTail = replyText.slice(-40).replace(/\n/g, '⏎')
   console.error(
     `[slack] delivering reply key=${chatId}:${threadTs} len=${replyText.length} head=${JSON.stringify(replyHead)} tail=${JSON.stringify(replyTail)}`,
   )
 
-  // Finalize the progress placeholder in place instead of posting a separate
-  // message and leaving "Working…" stranded; an empty reply turns it into a
-  // terminal notice. sendReplyToSlack falls back to a fresh post if the first
-  // chunk's update fails, so on a send error we log but never overwrite content
-  // that may already have been delivered.
   try {
     await sendReplyToSlack({
       chatId,
@@ -1096,6 +1092,62 @@ async function deliverToSession(
     console.error(
       `[slack] deliverToSession send failed key=${chatId}:${threadTs}${port ? ` port=${port}` : ''}: ${detail}`,
     )
+  }
+  return 'ok'
+}
+
+async function deliverToSession(
+  text: string,
+  meta: Record<string, string>,
+  progressTs?: string,
+): Promise<void> {
+  const chatId = meta.chat_id
+  const threadTs = meta.thread_ts || meta.ts
+  if (!chatId || !threadTs) {
+    throw new Error('deliverToSession requires meta.chat_id and meta.thread_ts or meta.ts')
+  }
+
+  const outcome = await attemptDelivery(text, meta, progressTs)
+  if (outcome !== 'transient') return
+
+  // Worker is busy with a prior turn. Queue this turn and drain it FIFO once
+  // the worker becomes available. Bounded queue: full queues fail immediately
+  // rather than silently building up (opshub#155).
+  const key = `${chatId}:${threadTs}`
+  const queue = threadQueues.get(key) ?? []
+  if (queue.length >= QUEUE_MAX_LEN) {
+    if (progressTs) {
+      await web.chat
+        .update({ channel: chatId, ts: progressTs, text: DELIVERY_FAILURE_NOTICE })
+        .catch(() => {})
+    }
+    return
+  }
+  queue.push({ text, meta, progressTs, enqueuedAt: Date.now() })
+  threadQueues.set(key, queue)
+
+  // Start a single drain loop per thread key (guarded by threadDraining).
+  if (!threadDraining.has(key)) {
+    threadDraining.add(key)
+    void runDeliveryDrainLoop({
+      getQueue: () => threadQueues.get(key) ?? [],
+      setQueue: (q) => {
+        if (q.length === 0) { threadQueues.delete(key) } else { threadQueues.set(key, q) }
+      },
+      attemptTurn: (turn) => attemptDelivery(turn.text, turn.meta, turn.progressTs),
+      onFailRemaining: async (turns) => {
+        for (const turn of turns) {
+          if (turn.progressTs) {
+            await web.chat
+              .update({ channel: chatId, ts: turn.progressTs, text: DELIVERY_FAILURE_NOTICE })
+              .catch(() => {})
+          }
+        }
+      },
+      pollMs: QUEUE_DRAIN_POLL_MS,
+      ttlMs: QUEUE_TTL_MS,
+      drainTimeoutMs: QUEUE_DRAIN_TIMEOUT_MS,
+    }).finally(() => { threadDraining.delete(key) })
   }
 }
 

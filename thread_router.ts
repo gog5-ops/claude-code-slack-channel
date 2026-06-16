@@ -86,6 +86,15 @@ interface ClaudeJsonlFallbackState {
   lineCount: number
 }
 
+// A Slack turn queued while the per-thread worker was busy. Drained FIFO once
+// the worker becomes ready (opshub#155).
+export interface QueuedTurn {
+  text: string
+  meta: Record<string, string>
+  progressTs: string | undefined
+  enqueuedAt: number
+}
+
 const DEFAULT_BASE_PORT = 3010
 const DEFAULT_MAX_PORTS = 90
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000
@@ -108,6 +117,11 @@ const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
 // stable status; re-polling recovers the real reply instead of falling back to a
 // possibly-partial JSONL (opshub#155, Phase 5 follow-up).
 const DEFAULT_REPLY_REPOLL_MS = 3_000
+// Drain-loop tunables: how long to wait between transient-error retries and
+// how long the drain window stays open before failing queued turns (opshub#155).
+const DEFAULT_QUEUE_DRAIN_POLL_MS = 5_000
+const DEFAULT_QUEUE_TTL_MS = 20 * 60_000
+const DEFAULT_QUEUE_DRAIN_TIMEOUT_MS = 20 * 60_000
 const DEFAULT_CLAUDE_MODEL = 'claude-opus-4-6'
 const DEFAULT_CLAUDE_FALLBACK_MODEL = 'claude-opus-4-8'
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
@@ -531,6 +545,69 @@ function heartbeatStatusPhrase(status: string | undefined): string | undefined {
   const verb = status.match(HEARTBEAT_STATUS_VERB_RE)?.[1]?.trim()
   if (!verb || /^thinking$/i.test(verb)) return undefined
   return `${verb}…`
+}
+
+// Returns true when the error is the transient "agent is not waiting for user
+// input" agentapi 500, indicating the worker is busy with a prior turn and the
+// new turn should be queued rather than dropped (opshub#155).
+export function isNotWaitingForUserInputError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return AGENT_WAITING_FOR_USER_INPUT_RE.test(msg)
+}
+
+// Drains a per-thread delivery queue: attempts each turn in FIFO order,
+// retrying transient failures (worker busy) up to drainTimeoutMs. Fatal errors
+// are dequeued and caller-notified; the remaining turns continue. When the
+// drain window expires, all still-queued turns are passed to onFailRemaining.
+// All I/O is via callbacks so the loop is pure/testable (opshub#155).
+export async function runDeliveryDrainLoop(options: {
+  getQueue: () => QueuedTurn[]
+  setQueue: (q: QueuedTurn[]) => void
+  attemptTurn: (turn: QueuedTurn) => Promise<'ok' | 'transient' | 'fatal'>
+  onFailRemaining: (turns: QueuedTurn[]) => Promise<void>
+  pollMs?: number
+  ttlMs?: number
+  drainTimeoutMs?: number
+  sleep?: (ms: number) => Promise<void>
+  now?: () => number
+}): Promise<void> {
+  const {
+    getQueue, setQueue, attemptTurn, onFailRemaining,
+  } = options
+  const pollMs = options.pollMs ?? DEFAULT_QUEUE_DRAIN_POLL_MS
+  const ttlMs = options.ttlMs ?? DEFAULT_QUEUE_TTL_MS
+  const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_QUEUE_DRAIN_TIMEOUT_MS
+  const sleepFn = options.sleep ?? sleep
+  const now = options.now ?? Date.now
+
+  const deadline = now() + drainTimeoutMs
+
+  while (now() < deadline) {
+    // Prune expired turns before each attempt.
+    const live = getQueue().filter((t) => now() - t.enqueuedAt < ttlMs)
+    setQueue(live)
+    if (live.length === 0) return
+
+    const turn = live[0]!
+    const result = await attemptTurn(turn)
+
+    if (result === 'transient') {
+      // Worker still busy — back off and retry.
+      await sleepFn(Math.min(pollMs, Math.max(1, deadline - now())))
+      continue
+    }
+
+    // ok or fatal: remove from queue and drain next turn immediately.
+    const remaining = getQueue().slice(1)
+    setQueue(remaining)
+    if (remaining.length === 0) return
+  }
+
+  // Drain window exceeded — fail any still-queued turns.
+  // Snapshot before clearing so setQueue([]) doesn't mutate what we pass out.
+  const remaining = getQueue().slice()
+  setQueue([])
+  if (remaining.length > 0) await onFailRemaining(remaining)
 }
 
 async function fetchLatestClaudeJsonlAssistantText(
