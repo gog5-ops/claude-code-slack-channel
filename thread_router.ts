@@ -37,6 +37,7 @@ export interface BuildAgentapiCommandOptions {
   claudeProjectsDir?: string
   sessionJsonlExists?: (path: string) => boolean
   model?: string
+  systemPromptFile?: string
 }
 
 export interface ThreadRouterOptions {
@@ -138,6 +139,11 @@ const AGENT_WAITING_FOR_USER_INPUT_RE = /message can only be sent when the agent
 // reply. Captured from a real worker .state file (opshub#155, Phase 5).
 const STARTUP_ARTIFACT_RE =
   /SessionStart:|Settings Warning|\bsetup issues:|Context Index:|\$CMEM\b|❯\s*\d+\.\s|^[ \t]*[─━]{20,}[ \t]*$/m
+// HTML-rendered tool-call result blocks emitted by the Claude Code TUI inside
+// agentapi /messages content. Claude Code collapses tool outputs into expandable
+// <details>/<summary> elements; these survive sanitizeAgentReply (which only strips
+// glyph-prefixed lines) and must never be posted to Slack as the final reply.
+const TUI_HTML_TOOL_RESULT_RE = /^[ \t]*<(?:details|summary|\/details|\/summary)\b/i
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -215,6 +221,17 @@ export function buildAgentapiCommand(
     ? ['--resume', claudeSessionId]
     : ['--session-id', claudeSessionId]
 
+  // Full-replace the system prompt for the Opus 4.8 tier only. agentapi forwards
+  // post-`--` args straight to Claude, and `--system-prompt-file` is honored in
+  // the interactive (non-`-p`) launch. 4.6 — or any model without a configured
+  // file — keeps Claude Code's default prompt untouched.
+  const systemPromptFile =
+    options.systemPromptFile ?? process.env['SLACK_THREAD_SYSTEM_PROMPT_FILE']
+  const systemPromptArgs =
+    systemPromptFile && /opus-4-8/.test(model)
+      ? ['--system-prompt-file', systemPromptFile]
+      : []
+
   // agentapi v0.12.2 rejects server-level --session-id. Claude accepts only
   // UUID session IDs, so the thread key is carried by the state file/name and
   // a deterministic UUID is used for Claude's session identity. Once Claude has
@@ -234,6 +251,7 @@ export function buildAgentapiCommand(
       key,
       '--model',
       model,
+      ...systemPromptArgs,
       '--effort',
       'max',
       '--allowedTools',
@@ -368,7 +386,8 @@ export async function forwardMessage(
   // the session JSONL, which is keyed to the posted message. Only when we have a
   // JSONL to fall back to, so a startup false-positive can never drop a reply.
   const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
-  if (!replyNeedsJsonlFallback(sanitized) && !replyLooksHeaderOnlyWithContext(sanitized) && !isStartupArtifact) {
+  const isHtmlIntermediate = replyLooksLikeHtmlIntermediate(sanitized)
+  if (!replyNeedsJsonlFallback(sanitized) && !replyLooksHeaderOnlyWithContext(sanitized) && !isStartupArtifact && !isHtmlIntermediate) {
     return sanitized
   }
 
@@ -377,20 +396,22 @@ export async function forwardMessage(
     : undefined
   const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
   // Diagnostic (no secrets): a truncated delivery surfaces here as a fallback
-  // path firing — e.g. agentapi /messages went empty/context-only and the JSONL
-  // held only a partial assistant turn, yielding "header\n\nN% context used". Log
-  // the lengths so a future mismatch is attributable to this path vs the
-  // sanitizer or sendReplyToSlack (opshub#155, Phase 5 follow-up).
+  // path firing — e.g. agentapi /messages went empty/context-only or contained
+  // HTML tool-result blocks (opshub#155). Log lengths so a future mismatch is
+  // attributable to this path vs the sanitizer or sendReplyToSlack.
+  const fallbackReason = isStartupArtifact ? 'startup-artifact'
+    : isHtmlIntermediate ? 'html-intermediate'
+    : 'agentapi-empty-or-context-only'
   console.error(
-    `[slack] forwardMessage reply fallback (${isStartupArtifact ? 'startup-artifact' : 'agentapi-empty-or-context-only'}): ` +
+    `[slack] forwardMessage reply fallback (${fallbackReason}): ` +
       `raw /messages len=${content.length}, agentapi sanitized len=${sanitized.length}, jsonl len=${sanitizedJsonl.length}`,
   )
   if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
 
-  // No real reply from AgentAPI or the JSONL. Never post the raw startup /
-  // context-index screen; surface the normalized context-usage line alone if we
-  // have one, else empty (deliverToSession skips empty replies).
-  if (isStartupArtifact) return contextUsageLine ?? ''
+  // No real reply from AgentAPI or the JSONL. Never post the raw startup screen
+  // or HTML tool-result blocks; surface the normalized context-usage line alone
+  // if we have one, else empty (deliverToSession skips empty replies).
+  if (isStartupArtifact || isHtmlIntermediate) return contextUsageLine ?? ''
   return sanitized
 }
 
@@ -430,7 +451,7 @@ function replyNeedsJsonlFallback(reply: string): boolean {
 }
 
 function replyNeedsMessageRepoll(reply: string): boolean {
-  return replyNeedsJsonlFallback(reply) || replyLooksHeaderOnlyWithContext(reply)
+  return replyNeedsJsonlFallback(reply) || replyLooksHeaderOnlyWithContext(reply) || replyLooksLikeHtmlIntermediate(reply)
 }
 
 function replyLooksHeaderOnlyWithContext(reply: string): boolean {
@@ -452,6 +473,22 @@ function replyLooksHeaderOnlyWithContext(reply: string): boolean {
 
 export function replyIsStartupArtifact(content: string): boolean {
   return STARTUP_ARTIFACT_RE.test(content)
+}
+
+// Returns true when the sanitized /messages content contains HTML tool-result
+// blocks (<details>/<summary>) outside code fences. These are intermediate TUI
+// artifacts that must trigger JSONL fallback rather than being posted to Slack.
+export function replyLooksLikeHtmlIntermediate(sanitized: string): boolean {
+  if (!sanitized.trim()) return false
+  let inFence = false
+  for (const rawLine of sanitized.replace(/\r\n?/g, '\n').split('\n')) {
+    const trimmedStart = rawLine.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+    if (fence) { inFence = !inFence; continue }
+    if (inFence) continue
+    if (TUI_HTML_TOOL_RESULT_RE.test(rawLine)) return true
+  }
+  return false
 }
 
 function latestContextUsageLine(content: string): string | undefined {

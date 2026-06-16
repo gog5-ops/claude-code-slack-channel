@@ -48,6 +48,7 @@ import {
   reapFakeActiveSessions,
   registryFilePath,
   replyIsStartupArtifact,
+  replyLooksLikeHtmlIntermediate,
   sanitizeAgentReply,
   sessionKeyFromMeta,
   stateFilePathForKey,
@@ -1956,6 +1957,50 @@ describe('thread_router agentapi command', () => {
       else process.env['SLACK_THREAD_CLAUDE_MODEL'] = oldModel
     }
   })
+
+  test('adds --system-prompt-file only for the Opus 4.8 tier', () => {
+    const key = buildSessionKey('C_CMD', '1700000000.000600')
+    const promptFile = '/tmp/system-prompt.md'
+
+    const on = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+      model: 'claude-opus-4-8',
+      systemPromptFile: promptFile,
+    })
+    expect(on.args).toContain('--system-prompt-file')
+    expect(on.args[on.args.indexOf('--system-prompt-file') + 1]).toBe(promptFile)
+
+    const on1m = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+      model: 'claude-opus-4-8[1m]',
+      systemPromptFile: promptFile,
+    })
+    expect(on1m.args).toContain('--system-prompt-file')
+
+    const off = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+      cwd: tmpRoot,
+      claudeProjectsDir,
+      model: 'claude-opus-4-6',
+      systemPromptFile: promptFile,
+    })
+    expect(off.args).not.toContain('--system-prompt-file')
+
+    const oldEnv = process.env['SLACK_THREAD_SYSTEM_PROMPT_FILE']
+    delete process.env['SLACK_THREAD_SYSTEM_PROMPT_FILE']
+    try {
+      const noFile = buildAgentapiCommand(3010, key, tmpRoot, '/bin/agentapi', {
+        cwd: tmpRoot,
+        claudeProjectsDir,
+        model: 'claude-opus-4-8',
+      })
+      expect(noFile.args).not.toContain('--system-prompt-file')
+    } finally {
+      if (oldEnv === undefined) delete process.env['SLACK_THREAD_SYSTEM_PROMPT_FILE']
+      else process.env['SLACK_THREAD_SYSTEM_PROMPT_FILE'] = oldEnv
+    }
+  })
 })
 
 describe('thread_router ensureSession', () => {
@@ -3774,6 +3819,213 @@ describe('thread_router forwardMessage startup-artifact handling', () => {
       )
 
       expect(reply).toBe('12% context used')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('thread_router replyLooksLikeHtmlIntermediate', () => {
+  test('detects <details>/<summary> HTML tool-result blocks', () => {
+    expect(replyLooksLikeHtmlIntermediate('<details>\n<summary>Bash result</summary>\nhello\n</details>')).toBe(true)
+    expect(replyLooksLikeHtmlIntermediate('<summary>Result</summary>')).toBe(true)
+    expect(replyLooksLikeHtmlIntermediate('</details>')).toBe(true)
+    expect(replyLooksLikeHtmlIntermediate('</summary>')).toBe(true)
+    expect(replyLooksLikeHtmlIntermediate('preamble\n<details>\n<summary>X</summary>\nout\n</details>')).toBe(true)
+  })
+
+  test('does not flag normal assistant replies', () => {
+    expect(replyLooksLikeHtmlIntermediate('Here is the answer.')).toBe(false)
+    expect(replyLooksLikeHtmlIntermediate('8% context used')).toBe(false)
+    expect(replyLooksLikeHtmlIntermediate('')).toBe(false)
+    expect(replyLooksLikeHtmlIntermediate('The `<div>` tag creates a block element.')).toBe(false)
+    expect(replyLooksLikeHtmlIntermediate('<p>Inline HTML in prose is fine.</p>')).toBe(false)
+  })
+
+  test('does not flag <details>/<summary> inside code fences', () => {
+    const inFence = '```html\n<details>\n<summary>example</summary>\ncontent\n</details>\n```'
+    expect(replyLooksLikeHtmlIntermediate(inFence)).toBe(false)
+    // But content outside the fence is still detected
+    const mixed = '```html\n<details><summary>x</summary></details>\n```\n\nSome answer\n<details>\n<summary>bare</summary>\n</details>'
+    expect(replyLooksLikeHtmlIntermediate(mixed)).toBe(true)
+  })
+})
+
+describe('thread_router forwardMessage html-intermediate handling', () => {
+  function makeMeta(suffix = '1') {
+    return {
+      chat_id: `CHTML${suffix}`,
+      thread_ts: `190000000${suffix}.000001`,
+      ts: `190000000${suffix}.000002`,
+      message_id: `190000000${suffix}.000002`,
+      user: 'alex',
+      user_id: 'U999',
+    }
+  }
+
+  const HTML_TOOL_BLOCK = '<details>\n<summary>Bash(ls -la)</summary>\ntotal 120\ndrwxr-xr-x  2 user user 4096 Jun 16 .\n</details>'
+
+  test('falls back to JSONL when /messages contains HTML tool-result blocks', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-html-mid-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = makeMeta()
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'Here is the complete final answer.' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({ messages: [{ id: 1, role: 'agent', content: HTML_TOOL_BLOCK, time: '2026-06-06T00:00:01.000Z' }] }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099, 'hello',
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0 },
+        meta,
+      )
+
+      expect(reply).toBe('Here is the complete final answer.')
+      expect(reply).not.toContain('<details>')
+      expect(reply).not.toContain('<summary>')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('returns empty (not HTML) when /messages has HTML fragments and no JSONL', async () => {
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({ messages: [{ id: 1, role: 'agent', content: HTML_TOOL_BLOCK, time: '2026-06-06T00:00:01.000Z' }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    // No meta → no JSONL path
+    const reply = await forwardMessage(3099, 'hello', { fetch: fetchMock, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0 })
+    expect(reply).toBe('')
+    expect(reply).not.toContain('<details>')
+  })
+
+  test('does not falsely trigger on HTML inside a code fence in /messages', async () => {
+    // <details>/<summary> inside a ```html code block must NOT be treated as TUI
+    // intermediate — the whole reply (code block + prose) should pass through.
+    const codeBlockContent = '```html\n<details>\n<summary>example</summary>\nstuff\n</details>\n```\n\nReal reply content here.'
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status: 'stable' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/messages')) {
+        return new Response(
+          JSON.stringify({ messages: [{ id: 1, role: 'agent', content: codeBlockContent, time: '2026-06-06T00:00:01.000Z' }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', { fetch: fetchMock, statusPollMs: 1, messageSettleMs: 0 })
+    // Not falsely detected as html-intermediate — reply is non-empty and passes through
+    expect(reply).not.toBe('')
+    expect(reply).toContain('Real reply content here.')
+    expect(reply).toContain('```html') // code block preserved as-is
+  })
+
+  test('HTML with context footer falls back to JSONL not the HTML fragments', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-html-ctx-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = makeMeta('2')
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+
+      const htmlWithContext = `${HTML_TOOL_BLOCK}\n\n23% context used`
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'The real answer from JSONL.' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({ messages: [{ id: 1, role: 'agent', content: htmlWithContext, time: '2026-06-06T00:00:01.000Z' }] }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099, 'hello',
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0 },
+        meta,
+      )
+
+      expect(reply).toBe('The real answer from JSONL.\n\n23% context used')
+      expect(reply).not.toContain('<details>')
     } finally {
       rmSync(rawRoot, { recursive: true, force: true })
     }
