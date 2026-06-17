@@ -3131,6 +3131,97 @@ describe('thread_router forwardMessage', () => {
     }
   })
 
+  test('falls back to Claude project JSONL when AgentAPI latest agent message is stale background-task TUI scrollback', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-stale-tui-jsonl-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C123',
+      thread_ts: '1800000000.000003',
+      ts: '1800000000.000004',
+      message_id: '1800000000.000004',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+    const staleScrollback = [
+      'Agent 9683b7f4-5d03-5f79-a7ab-d6fb716eab3b resumed from transcript',
+      '← slack · opshub: old user prompt, not the current turn',
+      '',
+      'Background command 42 completed in 1m 12s',
+      'Output: /tmp/claude-1000/opshub/tasks/background-task.output',
+      '',
+      '你看看',
+      '',
+      '1514 chars',
+      '18% context used',
+    ].join('\n')
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'latest Slack turn' } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'actual assistant text after the latest Slack turn' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [{ id: 2, role: 'agent', content: staleScrollback, time: '2026-06-06T00:00:01.000Z' }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        'latest Slack turn',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+        },
+        meta,
+      )
+
+      expect(reply).toBe('actual assistant text after the latest Slack turn\n\n18% context used')
+      expect(reply).not.toContain('你看看')
+      expect(reply).not.toContain('resumed from transcript')
+      expect(reply).not.toContain('Background command')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
   test('does not use JSONL fallback when AgentAPI messages contain a normal reply', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-no-jsonl-fallback-'))
     const cwd = join(rawRoot, 'repo')

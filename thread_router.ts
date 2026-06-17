@@ -158,6 +158,12 @@ const STARTUP_ARTIFACT_RE =
 // <details>/<summary> elements; these survive sanitizeAgentReply (which only strips
 // glyph-prefixed lines) and must never be posted to Slack as the final reply.
 const TUI_HTML_TOOL_RESULT_RE = /^[ \t]*<(?:details|summary|\/details|\/summary)\b/i
+// Stale Claude Code TUI scrollback sometimes appears as the latest AgentAPI
+// agent message after a resumed background task. It can sanitize to plausible
+// prose (for example an old final reply), but it is not bounded by the current
+// Slack inbound echo and contains durable background-task/transcript markers.
+const STALE_TUI_SCROLLBACK_RE =
+  /\bAgent\b.*\bresumed from transcript\b|\bBackground command\b.*\bcompleted\b|\bOutput:\s*\/tmp\/claude-[^\n]*\/tasks\/[^\n]*output\b/i
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -401,7 +407,8 @@ export async function forwardMessage(
   // JSONL to fall back to, so a startup false-positive can never drop a reply.
   const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
   const isHtmlIntermediate = replyLooksLikeHtmlIntermediate(sanitized)
-  if (!replyNeedsJsonlFallback(sanitized) && !replyLooksHeaderOnlyWithContext(sanitized) && !isStartupArtifact && !isHtmlIntermediate) {
+  const isStaleTuiScrollback = Boolean(jsonlFallbackState) && replyLooksLikeStaleTuiScrollback(content, sanitized, text)
+  if (!replyNeedsJsonlFallback(sanitized) && !replyLooksHeaderOnlyWithContext(sanitized) && !isStartupArtifact && !isHtmlIntermediate && !isStaleTuiScrollback) {
     return sanitized
   }
 
@@ -415,6 +422,7 @@ export async function forwardMessage(
   // attributable to this path vs the sanitizer or sendReplyToSlack.
   const fallbackReason = isStartupArtifact ? 'startup-artifact'
     : isHtmlIntermediate ? 'html-intermediate'
+    : isStaleTuiScrollback ? 'stale-tui-scrollback'
     : 'agentapi-empty-or-context-only'
   console.error(
     `[slack] forwardMessage reply fallback (${fallbackReason}): ` +
@@ -425,7 +433,7 @@ export async function forwardMessage(
   // No real reply from AgentAPI or the JSONL. Never post the raw startup screen
   // or HTML tool-result blocks; surface the normalized context-usage line alone
   // if we have one, else empty (deliverToSession skips empty replies).
-  if (isStartupArtifact || isHtmlIntermediate) return contextUsageLine ?? ''
+  if (isStartupArtifact || isHtmlIntermediate || isStaleTuiScrollback) return contextUsageLine ?? ''
   return sanitized
 }
 
@@ -501,6 +509,24 @@ export function replyLooksLikeHtmlIntermediate(sanitized: string): boolean {
     if (fence) { inFence = !inFence; continue }
     if (inFence) continue
     if (TUI_HTML_TOOL_RESULT_RE.test(rawLine)) return true
+  }
+  return false
+}
+
+function replyLooksLikeStaleTuiScrollback(rawContent: string, sanitized: string, currentTurnText: string): boolean {
+  if (!sanitized.trim()) return false
+  if (containsCurrentSlackInboundEcho(rawContent, currentTurnText)) return false
+  return STALE_TUI_SCROLLBACK_RE.test(sanitized) || STALE_TUI_SCROLLBACK_RE.test(rawContent)
+}
+
+function containsCurrentSlackInboundEcho(content: string, currentTurnText: string): boolean {
+  const current = currentTurnText.replace(/\s+/g, ' ').trim()
+  if (!current) return false
+  const snippet = current.slice(0, Math.min(current.length, 64))
+  for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const normalized = line.replace(TUI_PREFIX_RE, '').replace(/\s+/g, ' ').trim()
+    if (SLACK_INBOUND_ECHO_RE.test(normalized) && normalized.includes(snippet)) return true
   }
   return false
 }
