@@ -2373,6 +2373,38 @@ describe('thread_router forwardMessage', () => {
     expect(reply).not.toContain('old user prompt')
   })
 
+  test('sanitizeAgentReply strips leaked Slack prompt envelope and memory context', () => {
+    const raw = [
+      'ts="1782305752.437579" user="syunigo" user_id="U0AU8C4N72M"',
+      'message_id="1782305752.437579" attachment_count="0">',
+      'You are replying in this Slack thread. Answer concisely for Slack.',
+      'If attachment_paths is present, inspect those local files with Read/Bash as',
+      'needed before answering.',
+      '</slack_context>',
+      '',
+      '<channel source="slack" chat_id="D0ATZTYC3KN" message_id="1782305752.437579"',
+      'user_id="U0AU8C4N72M" user="syunigo" ts="1782305752.437579"',
+      'thread_ts="1782304347.101329">',
+      '你是什么模型',
+      '</channel>',
+      '',
+      'Claude Opus 4.6 (1M context)。',
+      '',
+      '                                                               6% context used',
+      '<memory-context>',
+      'secret recalled memory that must not be posted',
+      '</memory-context>',
+    ].join('\n')
+
+    const reply = sanitizeAgentReply(raw)
+
+    expect(reply).toBe('Claude Opus 4.6 (1M context)。\n\n6% context used')
+    expect(reply).not.toContain('slack_context')
+    expect(reply).not.toContain('<channel')
+    expect(reply).not.toContain('memory-context')
+    expect(reply).not.toContain('secret recalled memory')
+  })
+
   test('sanitizeAgentReply leaves normal assistant replies unchanged', () => {
     const raw = [
       'Current answer only',
@@ -3217,6 +3249,290 @@ describe('thread_router forwardMessage', () => {
       expect(reply).not.toContain('你看看')
       expect(reply).not.toContain('resumed from transcript')
       expect(reply).not.toContain('Background command')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('prefers Claude JSONL over frame-bled TUI scrollback that splices the user echo into the reply (opshub#155)', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-frame-bleed-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C155',
+      thread_ts: '1800000000.000010',
+      ts: '1800000000.000011',
+      message_id: '1800000000.000011',
+      user: 'syunigo',
+      user_id: 'U155',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+    // Real shape captured from live port 3012: a PTY frame redraw bled the user
+    // echo text ("ok可以的 … 前夫已") into the MIDDLE of the assistant's line. No
+    // line-level sanitizer can separate mid-line bleed, so the clean JSONL reply
+    // (keyed to the posted message) must win whenever the snapshot is scrollback.
+    const userTurn = 'ok可以的 剧情发生的时候前夫已经深陷越走越远了'
+    const cleanReply = '好，前夫在故事开始时已经是沼泽深处的人了，理想主义只是他的过去。我把全部更新写进v6。\n\n已上传：典狱长_完整大纲v6.docx'
+    // Multi-line so it is NOT caught by the unrelated header-only heuristic — the
+    // bled fragment sits mid-line in an otherwise substantive multi-line reply.
+    const frameBled = [
+      `← slack · syunigo: ${userTurn}`,
+      '',
+      '● 好，前夫在故事开始时已经是沼泽深处ok可以的 剧情发生的时候前夫已人了，理想主义只是他的过去。我把全部更新写',
+      '  进v6。',
+      '',
+      '  Read 1 file, ran 1 shell command',
+      '',
+      '● 已上传：典狱长_完整大纲v6.docx',
+      '',
+      '18% context used',
+    ].join('\n')
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: userTurn } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: cleanReply }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [{ id: 2, role: 'agent', content: frameBled, time: '2026-06-06T00:00:01.000Z' }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        userTurn,
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+        },
+        meta,
+      )
+
+      expect(reply).toBe(`${cleanReply}\n\n18% context used`)
+      // The user-echo fragment must never be spliced into the delivered reply.
+      expect(reply).not.toContain('剧情发生的时候')
+      expect(reply).not.toContain('ok可以的')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('falls back to JSONL when current Slack echo is followed by stale background-task scrollback (opshub#155)', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-echo-plus-stale-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C155',
+      thread_ts: '1800000000.000020',
+      ts: '1800000000.000021',
+      message_id: '1800000000.000021',
+      user: 'opshub',
+      user_id: 'U155',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+    // The current turn's echo IS present, but stale background-task scrollback was
+    // redrawn after it. Presence of the current echo must NOT clear the stale
+    // suspicion — the clean JSONL reply must win (opshub#155).
+    const userTurn = 'current real question for this turn'
+    const cleanReply = 'fresh answer to the current question'
+    const echoPlusStale = [
+      `← slack · opshub: ${userTurn}`,
+      '',
+      'Agent 1234abcd-0000-5000-a000-000000000000 resumed from transcript',
+      'Background command 7 completed in 2m 03s',
+      'Output: /tmp/claude-1000/opshub/tasks/old-task.output',
+      '',
+      'stale answer left over from a previous background run',
+      '',
+      '21% context used',
+    ].join('\n')
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: userTurn } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: cleanReply }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          return new Response(JSON.stringify({ status: 'stable' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [{ id: 2, role: 'agent', content: echoPlusStale, time: '2026-06-06T00:00:01.000Z' }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        userTurn,
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+        },
+        meta,
+      )
+
+      expect(reply).toBe(`${cleanReply}\n\n21% context used`)
+      expect(reply).not.toContain('resumed from transcript')
+      expect(reply).not.toContain('Background command')
+      expect(reply).not.toContain('stale answer left over')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('does not deliver interim TUI content when the worker is still running at the forward timeout (opshub#155)', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-running-interim-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C155',
+      thread_ts: '1800000000.000030',
+      ts: '1800000000.000031',
+      message_id: '1800000000.000031',
+      user: 'opshub',
+      user_id: 'U155',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+    // A final-looking leftover from the previous turn (no current echo) that the
+    // settle loop keeps seeing while /status is still `running`. waitForStable
+    // returns on the first transient `stable`, then the worker resumes; the
+    // forward must time out and fall back, never deliver the interim (opshub#155).
+    const userTurn = 'please do the long task'
+    const cleanReply = 'final result after the worker actually finished'
+    const interim = 'leftover final-looking text from the previous turn'
+    let statusIdx = 0
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({ type: 'user', message: { role: 'user', content: userTurn } }),
+              JSON.stringify({
+                type: 'assistant',
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: cleanReply }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          // First poll (consumed by waitForStable) is a transient `stable`; every
+          // later poll is `running`, so the settle loop times out mid-run.
+          const status = statusIdx === 0 ? 'stable' : 'running'
+          statusIdx++
+          return new Response(JSON.stringify({ status }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [{ id: 2, role: 'agent', content: interim, time: '2026-06-06T00:00:01.000Z' }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        userTurn,
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+          forwardTimeoutMs: 40,
+        },
+        meta,
+      )
+
+      expect(reply).toBe(cleanReply)
+      expect(reply).not.toContain('leftover final-looking text')
     } finally {
       rmSync(rawRoot, { recursive: true, force: true })
     }

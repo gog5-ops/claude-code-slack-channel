@@ -381,7 +381,8 @@ export async function forwardMessage(
 
   await waitForStable(port, options, options.onHeartbeat)
 
-  let content = await waitForSettledAgentMessageContent(port, options)
+  const settled = await waitForSettledAgentMessageContent(port, options)
+  let content = settled.content
   let sanitized = sanitizeAgentReply(content)
 
   // Post-settle flush race: status can report stable while agentapi /messages is
@@ -391,7 +392,7 @@ export async function forwardMessage(
   // re-poll /messages briefly for the real reply. Startup-artifact screens keep
   // their JSONL-fallback handling.
   const needsMessageRepoll = replyNeedsMessageRepoll(sanitized)
-  if (needsMessageRepoll && !replyIsStartupArtifact(sanitized)) {
+  if (needsMessageRepoll && !replyIsStartupArtifact(sanitized) && !settled.settledWhileRunning) {
     const recovered = await repollMeaningfulAgentReply(port, options)
     if (recovered !== undefined) {
       content = recovered
@@ -408,7 +409,26 @@ export async function forwardMessage(
   const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
   const isHtmlIntermediate = replyLooksLikeHtmlIntermediate(sanitized)
   const isStaleTuiScrollback = Boolean(jsonlFallbackState) && replyLooksLikeStaleTuiScrollback(content, sanitized, text)
-  if (!replyNeedsJsonlFallback(sanitized) && !replyLooksHeaderOnlyWithContext(sanitized) && !isStartupArtifact && !isHtmlIntermediate && !isStaleTuiScrollback) {
+  // A /messages snapshot that still carries a rendered "← slack ·" inbound echo
+  // is a raw TUI scrollback capture. Those are subject to stale interleaving and
+  // mid-line PTY frame-bleed (the user echo bleeding into the assistant line)
+  // that no line-level sanitizer can repair, so prefer the timing-independent
+  // JSONL reply whenever one exists. Falls through to the sanitized text only if
+  // the JSONL has no reply yet (best effort, unchanged from before) (opshub#155).
+  const isTuiScrollbackShaped = Boolean(jsonlFallbackState) && containsSlackInboundEcho(content)
+  // Settle bailed at the forward-timeout while the worker was still running: the
+  // snapshot is interim (a prior turn's leftover or a mid-tool pause) and must
+  // never be finalized — fall back to JSONL, else context-only/empty (opshub#155).
+  const isInterimWhileRunning = settled.settledWhileRunning
+  if (
+    !replyNeedsJsonlFallback(sanitized) &&
+    !replyLooksHeaderOnlyWithContext(sanitized) &&
+    !isStartupArtifact &&
+    !isHtmlIntermediate &&
+    !isStaleTuiScrollback &&
+    !isTuiScrollbackShaped &&
+    !isInterimWhileRunning
+  ) {
     return sanitized
   }
 
@@ -420,9 +440,11 @@ export async function forwardMessage(
   // path firing — e.g. agentapi /messages went empty/context-only or contained
   // HTML tool-result blocks (opshub#155). Log lengths so a future mismatch is
   // attributable to this path vs the sanitizer or sendReplyToSlack.
-  const fallbackReason = isStartupArtifact ? 'startup-artifact'
+  const fallbackReason = isInterimWhileRunning ? 'interim-while-running'
+    : isStartupArtifact ? 'startup-artifact'
     : isHtmlIntermediate ? 'html-intermediate'
     : isStaleTuiScrollback ? 'stale-tui-scrollback'
+    : isTuiScrollbackShaped ? 'tui-scrollback-shaped'
     : 'agentapi-empty-or-context-only'
   console.error(
     `[slack] forwardMessage reply fallback (${fallbackReason}): ` +
@@ -430,10 +452,14 @@ export async function forwardMessage(
   )
   if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
 
-  // No real reply from AgentAPI or the JSONL. Never post the raw startup screen
-  // or HTML tool-result blocks; surface the normalized context-usage line alone
-  // if we have one, else empty (deliverToSession skips empty replies).
-  if (isStartupArtifact || isHtmlIntermediate || isStaleTuiScrollback) return contextUsageLine ?? ''
+  // No real reply from AgentAPI or the JSONL. Never post the raw startup screen,
+  // HTML tool-result blocks, or interim/running content; surface the normalized
+  // context-usage line alone if we have one, else empty (deliverToSession skips
+  // empty replies). A TUI-scrollback-shaped snapshot with no JSONL reply yet is
+  // the one case we still return as-is (best effort) rather than dropping.
+  if (isStartupArtifact || isHtmlIntermediate || isStaleTuiScrollback || isInterimWhileRunning) {
+    return contextUsageLine ?? ''
+  }
   return sanitized
 }
 
@@ -515,8 +541,17 @@ export function replyLooksLikeHtmlIntermediate(sanitized: string): boolean {
 
 function replyLooksLikeStaleTuiScrollback(rawContent: string, sanitized: string, currentTurnText: string): boolean {
   if (!sanitized.trim()) return false
+  // If stale background-task markers survive scoping into the sanitized reply, it
+  // is stale regardless of whether the current echo is present — the real failure
+  // shape is "current echo + stale old answer redrawn after it" (opshub#155).
+  if (STALE_TUI_SCROLLBACK_RE.test(sanitized)) return true
+  // No markers survived scoping. When the current turn's echo is present the
+  // scoped content is this turn's reply, so any markers in the raw snapshot were
+  // old scrollback above the echo — not stale.
   if (containsCurrentSlackInboundEcho(rawContent, currentTurnText)) return false
-  return STALE_TUI_SCROLLBACK_RE.test(sanitized) || STALE_TUI_SCROLLBACK_RE.test(rawContent)
+  // No current echo to anchor freshness and the raw snapshot carries stale
+  // markers → the whole capture is stale scrollback from a prior turn.
+  return STALE_TUI_SCROLLBACK_RE.test(rawContent)
 }
 
 function containsCurrentSlackInboundEcho(content: string, currentTurnText: string): boolean {
@@ -527,6 +562,34 @@ function containsCurrentSlackInboundEcho(content: string, currentTurnText: strin
     const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
     const normalized = line.replace(TUI_PREFIX_RE, '').replace(/\s+/g, ' ').trim()
     if (SLACK_INBOUND_ECHO_RE.test(normalized) && normalized.includes(snippet)) return true
+  }
+  return false
+}
+
+// True when the snapshot contains any rendered "← slack ·" inbound echo outside
+// code fences — i.e. it is a raw TUI scrollback capture rather than clean,
+// role-separated agent text. Fenced echoes (a reply quoting one in a code block)
+// are ignored so a legitimate answer is not misclassified (opshub#155).
+function containsSlackInboundEcho(content: string): boolean {
+  let inFence = false
+  let fenceMarker = ''
+  for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmedStart = line.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+    if (inFence) {
+      if (fence && fence[0] === fenceMarker[0] && fence.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+      continue
+    }
+    if (fence) {
+      inFence = true
+      fenceMarker = fence
+      continue
+    }
+    if (SLACK_INBOUND_ECHO_RE.test(line.replace(TUI_PREFIX_RE, '').trim())) return true
   }
   return false
 }
@@ -702,7 +765,7 @@ function isIgnoredClaudeAssistantText(text: string): boolean {
 async function waitForSettledAgentMessageContent(
   port: number,
   options: ThreadRouterOptions,
-): Promise<string> {
+): Promise<{ content: string; settledWhileRunning: boolean }> {
   const settleMs = Math.max(0, options.messageSettleMs ?? DEFAULT_MESSAGE_SETTLE_MS)
   const pollMs = Math.max(
     1,
@@ -734,15 +797,20 @@ async function waitForSettledAgentMessageContent(
       hasPrevious &&
       latestContent === previousContent
     ) {
-      return latestContent
+      return { content: latestContent, settledWhileRunning: false }
     } else {
       previousContent = latestContent
       hasPrevious = true
     }
 
     const now = Date.now()
-    if (now >= overallDeadline) return latestContent || ''
-    if (!running && (settleMs === 0 || now >= settleDeadline)) return latestContent || ''
+    // Overall ceiling hit. If the worker is still running, the snapshot is interim
+    // (a prior turn's leftover or a mid-tool pause); flag it so the caller falls
+    // back rather than finalizing interim content (opshub#155).
+    if (now >= overallDeadline) return { content: latestContent || '', settledWhileRunning: running }
+    if (!running && (settleMs === 0 || now >= settleDeadline)) {
+      return { content: latestContent || '', settledWhileRunning: false }
+    }
     const cap = running ? overallDeadline : settleDeadline
     await sleep(Math.min(pollMs, Math.max(1, cap - now)))
   }
@@ -792,6 +860,7 @@ async function repollMeaningfulAgentReply(
 
 export function sanitizeAgentReply(content: string): string {
   content = scopeToLatestSlackInboundEcho(content)
+  content = stripLeakedPromptContext(content)
 
   const sanitizedLines: string[] = []
   let inFence = false
@@ -859,6 +928,27 @@ export function sanitizeAgentReply(content: string): string {
   }
 
   return sanitizedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function stripLeakedPromptContext(content: string): string {
+  let stripped = content.replace(/\r\n?/g, '\n')
+
+  // Claude can occasionally echo the thread-router prompt envelope before the
+  // real answer. Never post those internal XML-ish wrappers or recalled-memory
+  // payloads back into Slack. Keep this before line-level TUI cleanup so the
+  // final answer and context-usage footer can still be normalized below.
+  stripped = stripped
+    .replace(/<slack_context\b[\s\S]*?<\/slack_context>\s*/gi, '')
+    .replace(/&lt;slack_context\b[\s\S]*?&lt;\/slack_context&gt;\s*/gi, '')
+    .replace(/^.*\bYou are replying in this Slack thread\.[\s\S]*?<\/slack_context>\s*/gim, '')
+    .replace(/^.*\bYou are replying in this Slack thread\.[\s\S]*?&lt;\/slack_context&gt;\s*/gim, '')
+    .replace(/<channel\b[^>]*source=["']slack["'][\s\S]*?<\/channel>\s*/gi, '')
+    .replace(/&lt;channel\b[^\n]*source=["']slack["'][\s\S]*?&lt;\/channel&gt;\s*/gi, '')
+    .replace(/<memory-context>[\s\S]*?<\/memory-context>\s*/gi, '')
+    .replace(/&lt;memory-context&gt;[\s\S]*?&lt;\/memory-context&gt;\s*/gi, '')
+    .replace(/^(?:[^\n]*(?:\bts=|\buser=|\buser_id=|\bmessage_id=|\battachment_count=)[^\n]*\n){1,6}/i, '')
+
+  return stripped
 }
 
 function scopeToLatestSlackInboundEcho(content: string): string {
