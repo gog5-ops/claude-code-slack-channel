@@ -629,6 +629,16 @@ export function buildHeartbeatMessage(info: HeartbeatInfo = {}): string {
   return match ? `${phrase} · ${match[1]} context used` : phrase
 }
 
+// Placeholder text shown while a new turn waits in the per-thread delivery queue
+// because the worker is busy with a prior message. Distinct from the active-work
+// heartbeat ("Working…") so the user can tell their message is queued, not yet
+// being processed, and is not a failure (opshub#155).
+export function buildQueuedMessage(info: HeartbeatInfo = {}): string {
+  const base = '⏳ Queued — the worker is busy with a previous message…'
+  const match = info.contextUsage?.match(/(\d+%)\s+context used/i)
+  return match ? `${base} · ${match[1]} context used` : base
+}
+
 function heartbeatStatusPhrase(status: string | undefined): string | undefined {
   if (!status) return undefined
   const verb = status.match(HEARTBEAT_STATUS_VERB_RE)?.[1]?.trim()
@@ -1480,6 +1490,20 @@ export async function getAgentStatus(
     throw new Error(`Unexpected agentapi status: ${String(body.status)}`)
   }
   return body.status
+}
+
+// Pre-POST liveness probe for a per-thread worker. A worker mid-turn reports
+// 'running' and would 500 a POST ("not waiting for user input"); probing first
+// lets the caller queue the new turn cleanly (with a "queued" placeholder)
+// instead of POST-thrashing and ultimately surfacing a delivery-failure notice.
+// 'running' → 'busy' (queue it); 'stable' → 'ready' (forward now). The probe can
+// throw while a worker is still spawning — callers fall through to forwardMessage,
+// whose own retry window covers that race (opshub#155).
+export async function probeWorkerForDelivery(
+  port: number,
+  options: ThreadRouterOptions = {},
+): Promise<'busy' | 'ready'> {
+  return (await getAgentStatus(port, options)) === 'running' ? 'busy' : 'ready'
 }
 
 async function isAgentHealthy(

@@ -53,7 +53,7 @@ import {
   type GateResult,
   type OutboundThreadRegistry,
 } from './lib.ts'
-import { buildHeartbeatMessage, claimSlackContextForSession, ensureSession, forwardMessage, isNotWaitingForUserInputError, runDeliveryDrainLoop, type HeartbeatInfo, type QueuedTurn } from './thread_router.ts'
+import { buildHeartbeatMessage, buildQueuedMessage, claimSlackContextForSession, ensureSession, forwardMessage, isNotWaitingForUserInputError, probeWorkerForDelivery, runDeliveryDrainLoop, type HeartbeatInfo, type QueuedTurn } from './thread_router.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -71,9 +71,16 @@ const DEFAULT_CHUNK_LIMIT = 20000
 // Per-thread delivery queue: max queued turns, per-turn TTL, and drain window.
 // Turns queued beyond QUEUE_MAX_LEN are failed immediately; turns still
 // undrainable after QUEUE_DRAIN_TIMEOUT_MS are failed via onFailRemaining.
+// The TTL/drain window must exceed the longest a worker can legitimately stay
+// busy on a single prior turn, or a queued turn is failed (or silently pruned)
+// while the worker is still healthy — the live opshub#155 signature, where a
+// worker ran a multi-hour task and a new turn surfaced DELIVERY_FAILURE_NOTICE
+// after the old 20-minute ceiling. 24h is a generous-but-bounded backstop that
+// only trips on a genuinely wedged worker; an unreachable/dead worker still
+// fast-fails via the 'fatal' path, and QUEUE_MAX_LEN still bounds queue length.
 const QUEUE_MAX_LEN = 5
-const QUEUE_TTL_MS = 20 * 60_000
-const QUEUE_DRAIN_TIMEOUT_MS = 20 * 60_000
+const QUEUE_TTL_MS = 24 * 60 * 60_000
+const QUEUE_DRAIN_TIMEOUT_MS = 24 * 60 * 60_000
 const QUEUE_DRAIN_POLL_MS = 5_000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
@@ -1039,6 +1046,19 @@ async function attemptDelivery(
   try {
     const session = await ensureSession(chatId, threadTs)
     port = session.port
+    // Pre-POST status probe: if the worker is mid-turn it would 500 the POST
+    // ("not waiting for user input"). Detect that up front and signal the caller
+    // to queue this turn instead of POST-thrashing and eventually surfacing a
+    // delivery-failure notice. Returns before claiming the slack-context flag so
+    // the eventual drain forward still carries it. A probe error (worker still
+    // spawning) falls through to forwardMessage, whose retry window covers the
+    // spawn race. The "Queued…" placeholder is set once by deliverToSession on
+    // enqueue, not here, so drain re-attempts don't spam chat.update (opshub#155).
+    let workerBusy = false
+    try {
+      workerBusy = (await probeWorkerForDelivery(port)) === 'busy'
+    } catch { /* probe failed — fall through to forward, which retries */ }
+    if (workerBusy) return 'transient'
     const includeSlackContext = await claimSlackContextForSession(chatId, threadTs)
     // While the worker is running, edit the progress message in place with a
     // rate-limited heartbeat showing Claude Code's live status verb.
@@ -1125,6 +1145,16 @@ async function deliverToSession(
   }
   queue.push({ text, meta, progressTs, enqueuedAt: Date.now() })
   threadQueues.set(key, queue)
+
+  // Show a clear "Queued…" placeholder once, on enqueue — distinct from the
+  // "Working…" heartbeat and from a failure notice, so the user knows the turn
+  // is waiting (not lost) behind a busy worker. The drain loop re-probes status
+  // silently, so this is not re-posted on every poll (opshub#155).
+  if (progressTs) {
+    await web.chat
+      .update({ channel: chatId, ts: progressTs, text: buildQueuedMessage() })
+      .catch(() => {})
+  }
 
   // Start a single drain loop per thread key (guarded by threadDraining).
   if (!threadDraining.has(key)) {

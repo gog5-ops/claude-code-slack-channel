@@ -35,6 +35,8 @@ import {
 import {
   buildAgentapiCommand,
   buildHeartbeatMessage,
+  buildQueuedMessage,
+  probeWorkerForDelivery,
   claudeProjectSessionJsonlPath,
   buildSessionKey,
   buildSlackContextPrompt,
@@ -5353,6 +5355,46 @@ function makeTurn(text: string, overrides: Partial<QueuedTurn> = {}): QueuedTurn
   }
 }
 
+describe('probeWorkerForDelivery', () => {
+  function statusFetch(status: 'running' | 'stable') {
+    return async (url: string) => {
+      if (url.endsWith('/status')) {
+        return new Response(JSON.stringify({ status }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+  }
+
+  test("reports 'busy' when the worker is mid-turn (running)", async () => {
+    expect(await probeWorkerForDelivery(3010, { fetch: statusFetch('running') })).toBe('busy')
+  })
+
+  test("reports 'ready' when the worker is stable", async () => {
+    expect(await probeWorkerForDelivery(3010, { fetch: statusFetch('stable') })).toBe('ready')
+  })
+
+  test('propagates probe errors (caller treats as spawn race and forwards)', async () => {
+    const failing = async () => { throw new Error('connect ECONNREFUSED') }
+    await expect(probeWorkerForDelivery(3010, { fetch: failing })).rejects.toThrow(/ECONNREFUSED/)
+  })
+})
+
+describe('buildQueuedMessage', () => {
+  test('shows a distinct queued placeholder (not a failure, not "Working…")', () => {
+    const msg = buildQueuedMessage()
+    expect(msg).toContain('Queued')
+    expect(msg).not.toContain('Failed to deliver')
+    expect(msg).not.toContain('Working…')
+  })
+
+  test('appends a parseable context-usage figure when present', () => {
+    expect(buildQueuedMessage({ contextUsage: '42% context used' })).toContain('42% context used')
+  })
+})
+
 describe('isNotWaitingForUserInputError', () => {
   test('detects the transient agentapi 500 body', () => {
     const err = new Error(
@@ -5462,6 +5504,41 @@ describe('runDeliveryDrainLoop', () => {
     })
 
     expect(delivered).toEqual(['good'])
+    expect(failed).toHaveLength(0)
+    expect(getQueue()).toHaveLength(0)
+  })
+
+  test('long-busy worker: stays queued across many polls, then delivers — no failure notice', async () => {
+    // Regression for the live opshub#155 signature: a worker busy on a multi-hour
+    // task keeps returning 'transient' (alive + busy). With a drain window that
+    // exceeds the busy period it must remain queued and finally deliver, never
+    // reaching onFailRemaining (DELIVERY_FAILURE_NOTICE). Mirrors production now
+    // using a 24h window vs the old 20-minute ceiling that failed such turns.
+    let clock = 0
+    const { getQueue, setQueue } = makeQueue([makeTurn('long-task', { progressTs: 'pq' })])
+    const delivered: QueuedTurn[] = []
+    const failed: QueuedTurn[] = []
+    let polls = 0
+
+    await runDeliveryDrainLoop({
+      getQueue,
+      setQueue,
+      attemptTurn: async (turn) => {
+        polls += 1
+        clock += 5_000 // simulate one 5s drain poll while the worker is busy
+        if (polls < 200) return 'transient' // ~16.7 simulated minutes of busy work
+        delivered.push(turn)
+        return 'ok'
+      },
+      onFailRemaining: async (turns) => { failed.push(...turns) },
+      pollMs: 0,
+      ttlMs: 24 * 60 * 60_000,
+      drainTimeoutMs: 24 * 60 * 60_000,
+      sleep: async () => {},
+      now: () => clock,
+    })
+
+    expect(delivered.map((t) => t.text)).toEqual(['long-task'])
     expect(failed).toHaveLength(0)
     expect(getQueue()).toHaveLength(0)
   })
