@@ -4533,6 +4533,106 @@ describe('thread_router forwardMessage heartbeat', () => {
   })
 })
 
+describe('thread_router forwardMessage forward-timeout (opshub#155 option A)', () => {
+  function okJson(body: unknown) {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
+  test('healthy worker running well past the old 15-minute ceiling still delivers the real reply', async () => {
+    // The live opshub#155 signature: a worker mid-turn on a multi-hour task stays
+    // 'running' for far longer than the old DEFAULT_FORWARD_TIMEOUT_MS (15m), so
+    // waitForStable used to throw → attemptDelivery → DELIVERY_FAILURE_NOTICE,
+    // even though the turn was healthy and would have produced a reply. With the
+    // 24h bound the forward waits for real completion and delivers the reply. A
+    // virtual clock makes 'past 15 minutes' simulable without real waiting.
+    let clock = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) return okJson({ ok: true })
+      if (url.endsWith('/status')) {
+        clock += 120_000 // each poll advances 2 simulated minutes
+        // Stay busy until 20 simulated minutes — comfortably past the old 15m bound.
+        return okJson({ status: clock < 20 * 60_000 ? 'running' : 'stable' })
+      }
+      if (url.endsWith('/messages')) {
+        return okJson({
+          messages: [
+            { id: 1, role: 'agent', content: 'done after the long task', time: '2026-06-06T00:00:01.000Z' },
+          ],
+        })
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    const reply = await forwardMessage(3099, 'hello', {
+      fetch: fetchMock,
+      statusPollMs: 1,
+      messageSettleMs: 0,
+      replyRepollMs: 0,
+      now: () => clock,
+    })
+
+    expect(reply).toBe('done after the long task')
+    // Proves we kept waiting past the old 15-minute ceiling instead of failing.
+    expect(clock).toBeGreaterThan(15 * 60 * 1000)
+  })
+
+  test('dead/unreachable worker still fast-fails (does not hang for the 24h bound)', async () => {
+    // The 24h bound must only govern a worker that stays reachably 'running'. A
+    // worker whose /status is unreachable throws on the first poll, so the forward
+    // rejects immediately and attemptDelivery finalizes the placeholder as a real
+    // 'fatal' failure — it never waits 24h. now() is pinned so any accidental
+    // reliance on the timeout would be visible (the reject must come from the
+    // probe error, not the deadline).
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) return okJson({ ok: true })
+      if (url.endsWith('/status')) throw new Error('connect ECONNREFUSED 127.0.0.1:3099')
+      if (url.endsWith('/messages')) return okJson({ messages: [] })
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    let threw: unknown
+    try {
+      await forwardMessage(3099, 'hello', { fetch: fetchMock, statusPollMs: 1, now: () => 0 })
+    } catch (err) {
+      threw = err
+    }
+
+    expect(threw).toBeInstanceOf(Error)
+    expect((threw as Error).message).toMatch(/ECONNREFUSED/)
+    // Not the transient "not waiting" busy error, so attemptDelivery classes it
+    // 'fatal' (fast-fail) rather than queueing it.
+    expect(isNotWaitingForUserInputError(threw)).toBe(false)
+  })
+
+  test('forward timeout is still bounded: a worker stuck running past forwardTimeoutMs throws', async () => {
+    // The bound did not disappear — only its default magnitude grew. A small
+    // explicit forwardTimeoutMs still trips when a worker never reaches stable,
+    // so a genuinely wedged-but-reachable worker cannot wedge a forward forever.
+    let clock = 0
+    const fetchMock = async (url: string) => {
+      if (url.endsWith('/message')) return okJson({ ok: true })
+      if (url.endsWith('/status')) {
+        clock += 100
+        return okJson({ status: 'running' }) // never settles
+      }
+      if (url.endsWith('/messages')) return okJson({ messages: [] })
+      throw new Error(`unexpected URL: ${url}`)
+    }
+
+    await expect(
+      forwardMessage(3099, 'hello', {
+        fetch: fetchMock,
+        statusPollMs: 1,
+        forwardTimeoutMs: 1_000,
+        now: () => clock,
+      }),
+    ).rejects.toThrow(/become stable/)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // validateSendableRoots — ccsc-a9z boot-time fail-fast
 //

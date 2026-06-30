@@ -101,7 +101,16 @@ const DEFAULT_LOCK_TIMEOUT_MS = 10_000
 const DEFAULT_LOCK_POLL_MS = 50
 const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000
 const DEFAULT_STATUS_POLL_MS = 1_000
-const DEFAULT_FORWARD_TIMEOUT_MS = 15 * 60 * 1000
+// Ceiling for a single forward: how long waitForStable waits for a worker to go
+// running → stable (and the settle loop's overall cap). This must exceed the
+// longest a healthy worker can legitimately stay busy on one turn, or a long
+// in-flight task (the live opshub#155 case: a ~3h47m download job) trips the old
+// 15-minute bound and is misclassified as a 'fatal' delivery failure, surfacing
+// the same "Failed to deliver" notice as the queue bug. 24h matches the queue
+// TTL/drain bound (server.ts). A dead/unreachable worker still fast-fails inside
+// one poll because getAgentStatus throws (ECONNREFUSED / unexpected status) —
+// the timeout only governs a worker that stays reachably 'running'.
+const DEFAULT_FORWARD_TIMEOUT_MS = 24 * 60 * 60 * 1000
 const DEFAULT_MESSAGE_SETTLE_MS = 750
 const DEFAULT_HEARTBEAT_MS = 30_000
 const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
@@ -1433,19 +1442,20 @@ async function waitForStable(
   options: ThreadRouterOptions,
   onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>,
 ): Promise<void> {
-  const deadline = Date.now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
+  const now = options.now || Date.now
+  const deadline = now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
   const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
   const heartbeatMs = Math.max(0, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
   let nextHeartbeatAt = 0
 
-  while (Date.now() <= deadline) {
+  while (now() <= deadline) {
     const status = await getAgentStatus(port, options)
     if (status === 'stable') return
     // status === 'running': emit a rate-limited progress heartbeat. The first
     // running poll fires immediately (liveness); later ones are throttled to
     // heartbeatMs. Best-effort context usage; failures never break the wait.
     if (onHeartbeat) {
-      const at = Date.now()
+      const at = now()
       if (at >= nextHeartbeatAt) {
         nextHeartbeatAt = at + heartbeatMs
         const info = await currentHeartbeatInfo(port, options)
