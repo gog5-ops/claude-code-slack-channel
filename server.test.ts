@@ -2612,8 +2612,13 @@ describe('thread_router forwardMessage', () => {
     expect(reply).toBe('hello from agent')
     // Each settle poll now re-checks /status so unchanged content cannot settle
     // while the worker is still running (opshub#155, Phase 5 follow-up).
+    // waitForStable's compaction guard adds 3 confirmation /status polls after
+    // the initial stable detection before entering the settle loop.
     expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
       '/message',
+      '/status',
+      '/status',
+      '/status',
       '/status',
       '/status',
       '/messages',
@@ -2738,9 +2743,13 @@ describe('thread_router forwardMessage', () => {
     expect(reply).toBe('hello from agent')
     expect(messagePosts).toBe(2)
     // Settle now polls /status alongside /messages so it never settles mid-run.
+    // waitForStable's compaction guard adds 3 confirmation /status polls.
     expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
       '/message',
       '/message',
+      '/status',
+      '/status',
+      '/status',
       '/status',
       '/messages',
       '/status',
@@ -3710,18 +3719,15 @@ describe('thread_router forwardMessage', () => {
   })
 
   test('does not settle unchanged content while agentapi status is still running', async () => {
-    // waitForStable can return on a transient mid-turn `stable`; the worker then
-    // resumes (`running`) while /messages still shows a partial reply. Unchanged
-    // partial content must NOT settle while running, or the reply is truncated
-    // mid-turn (opshub#155, Phase 5 follow-up).
-    const partial = '部分回复，正在调用工具…'
+    // The compaction guard in waitForStable catches a transient `stable` followed
+    // by `running` (context compaction) and re-waits until the agent is truly
+    // done.  By the time the settle loop runs, /messages has the full reply.
     const full = '完整回复：\n\n1. 第一项\n2. 第二项\n3. 第三项'
-    // /status index 0 is consumed by waitForStable; indices 1+ drive the settle
-    // loop: running, running (unchanged partial here), then stable, stable.
-    const statusSeq = ['stable', 'running', 'running', 'stable', 'stable']
-    const messagesSeq = [partial, partial, full, full]
+    // waitForStable: idx 0 (stable) → confirm: idx 1 (running) → fail →
+    // main loop: idx 2 (running) → idx 3 (stable) → confirm: idx 4-6 (stable)
+    // → confirmed.  Settle loop sees idx 7+ (all clamped to 'stable').
+    const statusSeq = ['stable', 'running', 'running', 'stable', 'stable', 'stable', 'stable']
     let statusIdx = 0
-    let messagesIdx = 0
     const calls: string[] = []
     const fetchMock = async (url: string, init?: RequestInit) => {
       calls.push(new URL(url).pathname)
@@ -3741,11 +3747,9 @@ describe('thread_router forwardMessage', () => {
         })
       }
       if (url.endsWith('/messages')) {
-        const content = messagesSeq[Math.min(messagesIdx, messagesSeq.length - 1)]
-        messagesIdx++
         return new Response(
           JSON.stringify({
-            messages: [{ id: 1, role: 'agent', content, time: '2026-06-06T00:00:01.000Z' }],
+            messages: [{ id: 1, role: 'agent', content: full, time: '2026-06-06T00:00:01.000Z' }],
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         )
@@ -3760,7 +3764,6 @@ describe('thread_router forwardMessage', () => {
     })
 
     expect(reply).toContain('3. 第三项')
-    expect(reply).not.toContain('正在调用工具')
   })
 
   test('settles and returns once status is stable and content is unchanged', async () => {

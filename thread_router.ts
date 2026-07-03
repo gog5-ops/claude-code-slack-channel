@@ -63,6 +63,7 @@ export interface ThreadRouterOptions {
   includeSlackContext?: boolean
   claudeProjectsDir?: string
   heartbeatMs?: number
+  stableConfirmPolls?: number
   onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>
 }
 
@@ -126,6 +127,12 @@ const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
 // stable status; re-polling recovers the real reply instead of falling back to a
 // possibly-partial JSONL (opshub#155, Phase 5 follow-up).
 const DEFAULT_REPLY_REPOLL_MS = 3_000
+// Context compaction can cause a brief false "stable" before the agent resumes
+// processing in a new context window.  Require this many consecutive stable
+// polls before waitForStable returns.  Expressed as a poll count (not wall-
+// clock time) so it scales with statusPollMs and tests with statusPollMs: 1
+// stay fast.  3 × 1 000 ms = 3 s confirmation window in production.
+const DEFAULT_STABLE_CONFIRM_POLLS = 3
 // Drain-loop tunables: how long to wait between transient-error retries and
 // how long the drain window stays open before failing queued turns (opshub#155).
 const DEFAULT_QUEUE_DRAIN_POLL_MS = 5_000
@@ -1446,11 +1453,31 @@ async function waitForStable(
   const deadline = now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
   const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
   const heartbeatMs = Math.max(0, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
+  const confirmPolls = Math.max(0, options.stableConfirmPolls ?? DEFAULT_STABLE_CONFIRM_POLLS)
   let nextHeartbeatAt = 0
+  let sawStable = false
 
   while (now() <= deadline) {
     const status = await getAgentStatus(port, options)
-    if (status === 'stable') return
+    if (status === 'stable') {
+      sawStable = true
+      // Compaction guard: context compaction can cause a brief false "stable"
+      // before the agent resumes processing in a new context window.  Require
+      // N consecutive stable polls so a compaction transition (stable → running
+      // → stable) re-enters the wait loop instead of returning stale content.
+      let confirmed = true
+      for (let i = 0; i < confirmPolls && now() <= deadline; i++) {
+        await sleep(pollMs)
+        const recheck = await getAgentStatus(port, options)
+        if (recheck !== 'stable') {
+          confirmed = false
+          break
+        }
+      }
+      if (confirmed) return
+      // Agent went back to running (context compaction) — continue waiting.
+      continue
+    }
     // status === 'running': emit a rate-limited progress heartbeat. The first
     // running poll fires immediately (liveness); later ones are throttled to
     // heartbeatMs. Best-effort context usage; failures never break the wait.
@@ -1464,6 +1491,12 @@ async function waitForStable(
     }
     await sleep(pollMs)
   }
+
+  // If the agent was seen stable at least once but confirmation could not
+  // complete (it stayed running after the transient stable), fall through to
+  // the settle loop which will handle the running state with its own
+  // settledWhileRunning / JSONL-fallback logic.
+  if (sawStable) return
 
   throw new Error(`Timed out waiting for agentapi to become stable on port ${port}`)
 }
