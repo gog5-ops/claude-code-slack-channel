@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'child_process'
 import { createHash } from 'crypto'
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'fs/promises'
+import { appendFile, chmod, mkdir, readFile, rename, stat, unlink, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
@@ -64,6 +64,8 @@ export interface ThreadRouterOptions {
   claudeProjectsDir?: string
   heartbeatMs?: number
   stableConfirmPolls?: number
+  emptyReprobeDelayMs?: number
+  emptyStableProbeLimit?: number
   onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>
 }
 
@@ -85,6 +87,10 @@ interface MessagesBody {
 interface ClaudeJsonlFallbackState {
   path: string
   lineCount: number
+  // Wall-clock delivery time. Post-summarization transcripts can reshape the
+  // delivered user record, so the assistant-text scan also accepts records
+  // provably written after delivery (opshub#155).
+  deliveredAtMs?: number
 }
 
 // A Slack turn queued while the per-thread worker was busy. Drained FIFO once
@@ -133,6 +139,14 @@ const DEFAULT_REPLY_REPOLL_MS = 3_000
 // clock time) so it scales with statusPollMs and tests with statusPollMs: 1
 // stay fast.  3 × 1 000 ms = 3 s confirmation window in production.
 const DEFAULT_STABLE_CONFIRM_POLLS = 3
+// A worker at high context usage summarizes its window BEFORE emitting the
+// first token of a turn; agentapi reports 'stable' during that pause, so an
+// all-paths-empty extraction usually means "turn not actually started or
+// finished yet", not "turn produced no reply". forwardMessage re-probes
+// instead of finalizing; it only gives up after this many consecutive
+// confirmed-stable-and-empty probes (≈2–3 min) (opshub#155, 2026-07-05).
+const DEFAULT_EMPTY_REPROBE_DELAY_MS = 2_000
+const DEFAULT_EMPTY_STABLE_PROBE_LIMIT = 24
 // Drain-loop tunables: how long to wait between transient-error retries and
 // how long the drain window stays open before failing queued turns (opshub#155).
 const DEFAULT_QUEUE_DRAIN_POLL_MS = 5_000
@@ -395,89 +409,138 @@ export async function forwardMessage(
     body: JSON.stringify({ content: forwardedContent, type: 'user' }),
   }, options)
 
-  await waitForStable(port, options, options.onHeartbeat)
+  // All-paths-empty extraction re-probes instead of finalizing (opshub#155,
+  // 2026-07-05 incident): a worker at high context usage summarizes its window
+  // BEFORE emitting the first token of a turn, and agentapi reports a
+  // confirmed 'stable' during that pause. The old single-shot flow finalized
+  // the placeholder as a bare context line within the first minute and nobody
+  // ever came back for the real reply. Give up only after the worker has been
+  // confirmed stable-and-empty repeatedly, or the overall deadline passes.
+  const nowFn = options.now || Date.now
+  const overallDeadline = nowFn() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
+  const reprobeDelayMs = Math.max(1, options.emptyReprobeDelayMs ?? DEFAULT_EMPTY_REPROBE_DELAY_MS)
+  const stableEmptyLimit = Math.max(1, options.emptyStableProbeLimit ?? DEFAULT_EMPTY_STABLE_PROBE_LIMIT)
+  let stableEmptyProbes = 0
 
-  const settled = await waitForSettledAgentMessageContent(port, options)
-  let content = settled.content
-  let sanitized = sanitizeAgentReply(content)
+  while (true) {
+    await waitForStable(port, options, options.onHeartbeat)
 
-  // Post-settle flush race: status can report stable while agentapi /messages is
-  // momentarily empty/context-only, or only a short header plus context footer,
-  // before the final assistant text lands. Rather than immediately returning a
-  // header-only "header\n\nN% context used" (the live opshub#155 signature),
-  // re-poll /messages briefly for the real reply. Startup-artifact screens keep
-  // their JSONL-fallback handling.
-  const needsMessageRepoll = replyNeedsMessageRepoll(sanitized)
-  if (needsMessageRepoll && !replyIsStartupArtifact(sanitized) && !settled.settledWhileRunning) {
-    const recovered = await repollMeaningfulAgentReply(port, options)
-    if (recovered !== undefined) {
-      content = recovered
-      sanitized = sanitizeAgentReply(content)
+    const settled = await waitForSettledAgentMessageContent(port, options)
+    let content = settled.content
+    let sanitized = sanitizeAgentReply(content)
+
+    // Post-settle flush race: status can report stable while agentapi /messages is
+    // momentarily empty/context-only, or only a short header plus context footer,
+    // before the final assistant text lands. Rather than immediately returning a
+    // header-only "header\n\nN% context used" (the live opshub#155 signature),
+    // re-poll /messages briefly for the real reply. Startup-artifact screens keep
+    // their JSONL-fallback handling.
+    const needsMessageRepoll = replyNeedsMessageRepoll(sanitized)
+    if (needsMessageRepoll && !replyIsStartupArtifact(sanitized) && !settled.settledWhileRunning) {
+      const recovered = await repollMeaningfulAgentReply(port, options)
+      if (recovered !== undefined) {
+        content = recovered
+        sanitized = sanitizeAgentReply(content)
+      }
     }
-  }
 
-  const contextUsageLine = latestContextUsageLine(content)
-  // A fresh worker's first /messages snapshot can be the Claude startup /
-  // context-index screen rather than a reply to the just-posted message. Treat
-  // it (alongside empty/context-only content) as "no real reply yet" and prefer
-  // the session JSONL, which is keyed to the posted message. Only when we have a
-  // JSONL to fall back to, so a startup false-positive can never drop a reply.
-  const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
-  const isHtmlIntermediate = replyLooksLikeHtmlIntermediate(sanitized)
-  const isStaleTuiScrollback = Boolean(jsonlFallbackState) && replyLooksLikeStaleTuiScrollback(content, sanitized, text)
-  // A /messages snapshot that still carries a rendered "← slack ·" inbound echo
-  // is a raw TUI scrollback capture. Those are subject to stale interleaving and
-  // mid-line PTY frame-bleed (the user echo bleeding into the assistant line)
-  // that no line-level sanitizer can repair, so prefer the timing-independent
-  // JSONL reply whenever one exists. Falls through to the sanitized text only if
-  // the JSONL has no reply yet (best effort, unchanged from before) (opshub#155).
-  const isTuiScrollbackShaped = Boolean(jsonlFallbackState) && containsSlackInboundEcho(content)
-  // Settle bailed at the forward-timeout while the worker was still running: the
-  // snapshot is interim (a prior turn's leftover or a mid-tool pause) and must
-  // never be finalized — fall back to JSONL, else context-only/empty (opshub#155).
-  const isInterimWhileRunning = settled.settledWhileRunning
-  if (
-    !replyNeedsJsonlFallback(sanitized) &&
-    !replyLooksHeaderOnlyWithContext(sanitized) &&
-    !isStartupArtifact &&
-    !isHtmlIntermediate &&
-    !isStaleTuiScrollback &&
-    !isTuiScrollbackShaped &&
-    !isInterimWhileRunning
-  ) {
+    const contextUsageLine = latestContextUsageLine(content)
+    // A fresh worker's first /messages snapshot can be the Claude startup /
+    // context-index screen rather than a reply to the just-posted message. Treat
+    // it (alongside empty/context-only content) as "no real reply yet" and prefer
+    // the session JSONL, which is keyed to the posted message. Only when we have a
+    // JSONL to fall back to, so a startup false-positive can never drop a reply.
+    const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
+    const isHtmlIntermediate = replyLooksLikeHtmlIntermediate(sanitized)
+    const isStaleTuiScrollback = Boolean(jsonlFallbackState) && replyLooksLikeStaleTuiScrollback(content, sanitized, text)
+    // A /messages snapshot that still carries a rendered "← slack ·" inbound echo
+    // is a raw TUI scrollback capture. Those are subject to stale interleaving and
+    // mid-line PTY frame-bleed (the user echo bleeding into the assistant line)
+    // that no line-level sanitizer can repair, so prefer the timing-independent
+    // JSONL reply whenever one exists. Falls through to the sanitized text only if
+    // the JSONL has no reply yet (best effort, unchanged from before) (opshub#155).
+    const isTuiScrollbackShaped = Boolean(jsonlFallbackState) && containsSlackInboundEcho(content)
+    // Settle bailed at the forward-timeout while the worker was still running: the
+    // snapshot is interim (a prior turn's leftover or a mid-tool pause) and must
+    // never be finalized — fall back to JSONL, else context-only/empty (opshub#155).
+    const isInterimWhileRunning = settled.settledWhileRunning
+    if (
+      !replyNeedsJsonlFallback(sanitized) &&
+      !replyLooksHeaderOnlyWithContext(sanitized) &&
+      !isStartupArtifact &&
+      !isHtmlIntermediate &&
+      !isStaleTuiScrollback &&
+      !isTuiScrollbackShaped &&
+      !isInterimWhileRunning
+    ) {
+      return sanitized
+    }
+
+    const jsonlContent = jsonlFallbackState
+      ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
+      : undefined
+    const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
+    // Diagnostic (no secrets): a truncated delivery surfaces here as a fallback
+    // path firing — e.g. agentapi /messages went empty/context-only or contained
+    // HTML tool-result blocks (opshub#155). Log lengths so a future mismatch is
+    // attributable to this path vs the sanitizer or sendReplyToSlack.
+    const fallbackReason = isInterimWhileRunning ? 'interim-while-running'
+      : isStartupArtifact ? 'startup-artifact'
+      : isHtmlIntermediate ? 'html-intermediate'
+      : isStaleTuiScrollback ? 'stale-tui-scrollback'
+      : isTuiScrollbackShaped ? 'tui-scrollback-shaped'
+      : 'agentapi-empty-or-context-only'
+    const diagnostic = `forwardMessage reply fallback (${fallbackReason}): ` +
+      `raw /messages len=${content.length}, agentapi sanitized len=${sanitized.length}, jsonl len=${sanitizedJsonl.length}`
+    console.error(`[slack] ${diagnostic}`)
+    routerLog(diagnostic, options.stateDir)
+    if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
+
+    // Nothing anywhere yet. Worker still running (or settle bailed mid-run) —
+    // or confirmed stable but the turn may not even have started emitting
+    // (context-window summarization pause). Re-enter the wait.
+    stableEmptyProbes = isInterimWhileRunning ? 0 : stableEmptyProbes + 1
+    if (nowFn() < overallDeadline && stableEmptyProbes < stableEmptyLimit) {
+      await sleep(reprobeDelayMs)
+      continue
+    }
+
+    // Genuinely nothing to deliver after repeated confirmed-stable-empty probes
+    // (or deadline). Never post the raw startup screen, HTML tool-result blocks,
+    // or interim/running content; surface the normalized context-usage line
+    // alone if we have one, else empty (deliverToSession skips empty replies).
+    // A TUI-scrollback-shaped snapshot with no JSONL reply yet is the one case
+    // we still return as-is (best effort) rather than dropping.
+    routerLog(
+      `forwardMessage giving up after ${stableEmptyProbes} stable-empty probes (reason=${fallbackReason})`,
+      options.stateDir,
+    )
+    if (isStartupArtifact || isHtmlIntermediate || isStaleTuiScrollback || isInterimWhileRunning) {
+      return contextUsageLine ?? ''
+    }
     return sanitized
   }
-
-  const jsonlContent = jsonlFallbackState
-    ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
-    : undefined
-  const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
-  // Diagnostic (no secrets): a truncated delivery surfaces here as a fallback
-  // path firing — e.g. agentapi /messages went empty/context-only or contained
-  // HTML tool-result blocks (opshub#155). Log lengths so a future mismatch is
-  // attributable to this path vs the sanitizer or sendReplyToSlack.
-  const fallbackReason = isInterimWhileRunning ? 'interim-while-running'
-    : isStartupArtifact ? 'startup-artifact'
-    : isHtmlIntermediate ? 'html-intermediate'
-    : isStaleTuiScrollback ? 'stale-tui-scrollback'
-    : isTuiScrollbackShaped ? 'tui-scrollback-shaped'
-    : 'agentapi-empty-or-context-only'
-  console.error(
-    `[slack] forwardMessage reply fallback (${fallbackReason}): ` +
-      `raw /messages len=${content.length}, agentapi sanitized len=${sanitized.length}, jsonl len=${sanitizedJsonl.length}`,
-  )
-  if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
-
-  // No real reply from AgentAPI or the JSONL. Never post the raw startup screen,
-  // HTML tool-result blocks, or interim/running content; surface the normalized
-  // context-usage line alone if we have one, else empty (deliverToSession skips
-  // empty replies). A TUI-scrollback-shaped snapshot with no JSONL reply yet is
-  // the one case we still return as-is (best effort) rather than dropping.
-  if (isStartupArtifact || isHtmlIntermediate || isStaleTuiScrollback || isInterimWhileRunning) {
-    return contextUsageLine ?? ''
-  }
-  return sanitized
 }
+
+// Persistent, size-capped delivery diagnostics. Every silent-loss incident so
+// far (opshub#155) was undiagnosable because the router only wrote to the MCP
+// child's stderr, which nothing captures. Never throws; never blocks delivery.
+const ROUTER_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+export function routerLog(line: string, stateDir?: string): void {
+  const path = join(stateDir || defaultStateDir(), 'router.log')
+  const entry = `${new Date().toISOString()} ${line}\n`
+  void (async () => {
+    try {
+      const st = await stat(path).catch(() => undefined)
+      if (st && st.size > ROUTER_LOG_MAX_BYTES) await rename(path, `${path}.1`)
+      await appendFile(path, entry, { mode: 0o600 })
+    } catch {
+      // logging must never break delivery
+    }
+  })()
+}
+
 
 async function captureClaudeJsonlFallbackState(
   meta: Record<string, string>,
@@ -491,7 +554,7 @@ async function captureClaudeJsonlFallbackState(
       sessionId,
       options.claudeProjectsDir,
     )
-    return { path, lineCount: await countExistingJsonlLines(path) }
+    return { path, lineCount: await countExistingJsonlLines(path), deliveredAtMs: Date.now() }
   } catch {
     return undefined
   }
@@ -754,7 +817,13 @@ async function fetchLatestClaudeJsonlAssistantText(
       sawPostedUser = true
       continue
     }
-    if (!sawPostedUser || record['type'] !== 'assistant') continue
+    if (record['type'] !== 'assistant') continue
+    if (!sawPostedUser) {
+      // No user record seen in the window (post-summarization transcripts can
+      // reshape it): accept assistant records provably written after delivery.
+      const ts = typeof record['timestamp'] === 'string' ? Date.parse(record['timestamp']) : NaN
+      if (!Number.isFinite(ts) || state.deliveredAtMs === undefined || ts < state.deliveredAtMs) continue
+    }
 
     const assistantText = extractClaudeAssistantText(record)
     if (assistantText && !isIgnoredClaudeAssistantText(assistantText)) latestText = assistantText
