@@ -430,6 +430,29 @@ export async function forwardMessage(
   let stableEmptyProbes = 0
 
   while (true) {
+    // A later real inbound turn recorded in the session JSONL proves this
+    // turn's window closed — its last assistant text IS the final reply.
+    // Deliver before waiting for worker quiet: with turns queued back-to-back
+    // the worker re-enters 'running' within a second of finishing each turn,
+    // the candidate-confirm quiet window never elapses, and every finished
+    // reply would otherwise be rejected as "worker resumed" until the forward
+    // deadline (opshub#155 livelock, 2026-07-06).
+    if (jsonlFallbackState) {
+      const scan = await scanClaudeJsonlTurnReply(jsonlFallbackState)
+      const sanitizedScan = scan.text ? sanitizeAgentReply(scan.text) : ''
+      if (scan.turnComplete && sanitizedScan) {
+        let contextLine: string | undefined
+        try {
+          const latest = await fetchLatestAgentMessageContent(port, options)
+          contextLine = latest ? latestContextUsageLine(latest) : undefined
+        } catch {
+          // Best effort — deliver without the context footer.
+        }
+        routerLog('turn window closed (next inbound turn recorded); delivering final reply', options.stateDir)
+        return appendContextUsageLine(sanitizedScan, contextLine)
+      }
+    }
+
     await waitForStable(port, options, options.onHeartbeat)
 
     const settled = await waitForSettledAgentMessageContent(port, options)
@@ -483,10 +506,10 @@ export async function forwardMessage(
       return sanitized
     }
 
-    const jsonlContent = jsonlFallbackState
-      ? await fetchLatestClaudeJsonlAssistantText(jsonlFallbackState)
+    const jsonlScan = jsonlFallbackState
+      ? await scanClaudeJsonlTurnReply(jsonlFallbackState)
       : undefined
-    const sanitizedJsonl = jsonlContent ? sanitizeAgentReply(jsonlContent) : ''
+    const sanitizedJsonl = jsonlScan?.text ? sanitizeAgentReply(jsonlScan.text) : ''
     // Diagnostic (no secrets): a truncated delivery surfaces here as a fallback
     // path firing — e.g. agentapi /messages went empty/context-only or contained
     // HTML tool-result blocks (opshub#155). Log lengths so a future mismatch is
@@ -505,6 +528,9 @@ export async function forwardMessage(
     // worker may just be in a false-stable pause). At the deadline, deliver
     // the transcript's last word as-is — best effort beats nothing.
     if (sanitizedJsonl && jsonlFallbackState && nowFn() < overallDeadline) {
+      // Window already closed → the candidate is the turn's final reply; the
+      // quiet-window confirm would reject it against the NEXT turn's activity.
+      if (jsonlScan?.turnComplete) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
       const confirmed = await confirmJsonlCandidate(port, jsonlFallbackState, sanitizedJsonl, options)
       if (confirmed !== undefined) return appendContextUsageLine(confirmed, contextUsageLine)
       // Worker resumed — the candidate was mid-turn narration. Re-enter the wait.
@@ -806,20 +832,29 @@ export async function runDeliveryDrainLoop(options: {
   if (remaining.length > 0) await onFailRemaining(remaining)
 }
 
-async function fetchLatestClaudeJsonlAssistantText(
+// Scans the session JSONL for the forwarded turn's reply. `text` is the last
+// assistant text inside the turn's window; `turnComplete` reports whether a
+// LATER real inbound turn was recorded. claude-code only records an inbound
+// turn when it starts consuming it, so its presence proves the window closed
+// and `text` is the turn's final reply — deliverable without any worker-quiet
+// confirmation (opshub#155 livelock, 2026-07-06).
+async function scanClaudeJsonlTurnReply(
   state: ClaudeJsonlFallbackState,
-): Promise<string | undefined> {
+): Promise<{ text: string | undefined; turnComplete: boolean }> {
   let raw: string
   try {
     raw = await readFile(state.path, 'utf8')
   } catch (err) {
-    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return undefined
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
+      return { text: undefined, turnComplete: false }
+    }
     throw err
   }
 
   const lines = raw.split('\n').filter((line) => line.trim())
   let sawPostedUser = false
   let latestText: string | undefined
+  let turnComplete = false
 
   for (const line of lines.slice(state.lineCount)) {
     let entry: unknown
@@ -840,7 +875,10 @@ async function fetchLatestClaudeJsonlAssistantText(
       if (isRealUserTurn) {
         // A second inbound turn means our turn's window ended; never pick up
         // the NEXT turn's reply into this one (queued-turn correctness).
-        if (sawPostedUser) break
+        if (sawPostedUser) {
+          turnComplete = true
+          break
+        }
         sawPostedUser = true
       }
       continue
@@ -857,7 +895,7 @@ async function fetchLatestClaudeJsonlAssistantText(
     if (assistantText && !isIgnoredClaudeAssistantText(assistantText)) latestText = assistantText
   }
 
-  return latestText
+  return { text: latestText, turnComplete }
 }
 
 function extractClaudeAssistantText(record: Record<string, unknown>): string {
@@ -904,6 +942,15 @@ async function confirmJsonlCandidate(
 
   while (true) {
     await sleep(Math.min(pollMs, Math.max(1, quietSince + confirmMs - Date.now())))
+    // Turn-window check first: a later real inbound turn in the JSONL proves
+    // the candidate's turn finished. Worker 'running'/spinner state then
+    // belongs to the NEXT queued turn and must not reject the finished reply
+    // (opshub#155 livelock, 2026-07-06).
+    const scan = await scanClaudeJsonlTurnReply(state)
+    if (scan.turnComplete) {
+      const sanitizedFinal = scan.text ? sanitizeAgentReply(scan.text) : ''
+      return sanitizedFinal || candidate
+    }
     try {
       if ((await getAgentStatus(port, options)) === 'running') return undefined
     } catch {
@@ -918,8 +965,7 @@ async function confirmJsonlCandidate(
     } catch {
       // /messages hiccup: fall through to the transcript check
     }
-    const latest = await fetchLatestClaudeJsonlAssistantText(state)
-    const sanitizedLatest = latest ? sanitizeAgentReply(latest) : ''
+    const sanitizedLatest = scan.text ? sanitizeAgentReply(scan.text) : ''
     if (sanitizedLatest && sanitizedLatest !== candidate) {
       candidate = sanitizedLatest // newer text wins; restart the quiet window
       quietSince = Date.now()

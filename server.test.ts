@@ -3476,6 +3476,115 @@ describe('thread_router forwardMessage', () => {
     }
   })
 
+  test('delivers the completed turn reply once the next queued turn opens, even while the worker stays busy (opshub#155 livelock)', async () => {
+    // 2026-07-06 live incident, round 2: with turns queued back-to-back the
+    // worker re-enters 'running' within a second of finishing each turn, so the
+    // candidate-confirm quiet window NEVER elapses and every finished reply is
+    // rejected as "worker resumed" until the 24h forward deadline. A later real
+    // inbound turn recorded in the session JSONL proves our turn's window is
+    // closed — the reply must deliver immediately, without any quiet window.
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-turn-complete-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C123',
+      thread_ts: '1800000000.000001',
+      ts: '1800000000.000002',
+      message_id: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          // Our turn completed and the next queued Slack turn already opened:
+          // user(M) → assistant(final) → user(M2). claude-code only records an
+          // inbound turn when it starts consuming it, so user(M2) is proof that
+          // the assistant text before it was turn M's final reply.
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({
+                type: 'user',
+                timestamp: new Date().toISOString(),
+                message: { role: 'user', content: 'hello' },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(Date.now() + 5).toISOString(),
+                message: {
+                  model: 'claude-fable-5',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'the finished reply' }],
+                },
+              }),
+              JSON.stringify({
+                type: 'user',
+                timestamp: new Date(Date.now() + 10).toISOString(),
+                message: { role: 'user', content: 'next queued question' },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          // The worker is already busy with the NEXT turn and stays busy —
+          // multi-minute tool-heavy turns with more messages queued behind.
+          return new Response(JSON.stringify({ status: 'running' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          // Live TUI spinner from the next turn plus the context footer — the
+          // exact /messages shape captured during the incident.
+          return new Response(
+            JSON.stringify({
+              messages: [{
+                id: 2,
+                role: 'agent',
+                content: '✽ Effecting… (3m 18s · ↓ 6.7k tokens)\n71% context used',
+                time: '2026-06-06T00:00:01.000Z',
+              }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+          emptyReprobeDelayMs: 1,
+          emptyStableProbeLimit: 50,
+          candidateConfirmMs: 20,
+          forwardTimeoutMs: 60_000,
+        },
+        meta,
+      )
+
+      expect(reply).toBe('the finished reply\n\n71% context used')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  }, 3_000)
+
   test('falls back to Claude project JSONL when AgentAPI latest agent message is stale background-task TUI scrollback', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-stale-tui-jsonl-'))
     const cwd = join(rawRoot, 'repo')
