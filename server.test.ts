@@ -3167,6 +3167,10 @@ describe('thread_router forwardMessage', () => {
           // /messages stays context-only here; skip the re-poll to test the pure
           // JSONL fallback path without waiting out the re-poll budget.
           replyRepollMs: 0,
+          // The mock TUI permanently shows a spinner line; candidate
+          // confirmation would (correctly) treat that as busy forever. This
+          // test targets the fallback mechanics, so skip confirmation.
+          candidateConfirmMs: 0,
         },
         meta,
       )
@@ -3263,6 +3267,7 @@ describe('thread_router forwardMessage', () => {
           replyRepollMs: 0,
           emptyReprobeDelayMs: 1,
           emptyStableProbeLimit: 50,
+          candidateConfirmMs: 20,
         },
         meta,
       )
@@ -3350,11 +3355,122 @@ describe('thread_router forwardMessage', () => {
           replyRepollMs: 0,
           emptyReprobeDelayMs: 1,
           emptyStableProbeLimit: 2,
+          candidateConfirmMs: 20,
         },
         meta,
       )
 
       expect(reply).toBe('reshaped-window reply\n\n98% context used')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('discards a mid-turn narration candidate and returns the eventual final reply (opshub#155)', async () => {
+    // 2026-07-06 live incident: a false stable mid-turn let the JSONL fallback
+    // capture the turn's OPENING narration as the reply. Candidate confirmation
+    // must reject it once the worker resumes, then pick up the real final text.
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-confirm-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'C123',
+      thread_ts: '1800000000.000001',
+      ts: '1800000000.000002',
+      message_id: '1800000000.000002',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      let statusCalls = 0
+      let finalAppended = false
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          // Delivery lands the user record plus the turn's opening narration —
+          // the trap the old code fell into.
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({
+                type: 'user',
+                timestamp: new Date().toISOString(),
+                message: { role: 'user', content: 'hello' },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date().toISOString(),
+                message: {
+                  model: 'claude-fable-5',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'opening narration, not the reply' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          statusCalls++
+          if (statusCalls >= 10 && !finalAppended) {
+            finalAppended = true
+            appendFileSync(
+              jsonlPath,
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date().toISOString(),
+                message: {
+                  model: 'claude-fable-5',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'the real final reply' }],
+                },
+              }) + '\n',
+            )
+          }
+          // Calls 7-8 report running: the worker resumed right after the false
+          // stable, so the narration candidate must be discarded.
+          const status = statusCalls === 7 || statusCalls === 8 ? 'running' : 'stable'
+          return new Response(JSON.stringify({ status }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          return new Response(
+            JSON.stringify({
+              messages: [{ id: 2, role: 'agent', content: '98% context used', time: '2026-06-06T00:00:01.000Z' }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        'hello',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+          emptyReprobeDelayMs: 1,
+          emptyStableProbeLimit: 50,
+          candidateConfirmMs: 20,
+        },
+        meta,
+      )
+
+      expect(reply).toBe('the real final reply\n\n98% context used')
     } finally {
       rmSync(rawRoot, { recursive: true, force: true })
     }
@@ -3436,6 +3552,7 @@ describe('thread_router forwardMessage', () => {
           claudeProjectsDir,
           includeSlackContext: false,
           statusPollMs: 1,
+          candidateConfirmMs: 0,
           messageSettleMs: 0,
           replyRepollMs: 0,
         },
@@ -3535,6 +3652,7 @@ describe('thread_router forwardMessage', () => {
           claudeProjectsDir,
           includeSlackContext: false,
           statusPollMs: 1,
+          candidateConfirmMs: 0,
           messageSettleMs: 0,
           replyRepollMs: 0,
         },
@@ -3630,6 +3748,7 @@ describe('thread_router forwardMessage', () => {
           claudeProjectsDir,
           includeSlackContext: false,
           statusPollMs: 1,
+          candidateConfirmMs: 0,
           messageSettleMs: 0,
           replyRepollMs: 0,
         },
@@ -4356,7 +4475,7 @@ describe('thread_router forwardMessage startup-artifact handling', () => {
       const reply = await forwardMessage(
         3099,
         'hello',
-        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, emptyReprobeDelayMs: 1, emptyStableProbeLimit: 1 },
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, emptyReprobeDelayMs: 1, emptyStableProbeLimit: 1, candidateConfirmMs: 0 },
         meta,
       )
 
@@ -4385,7 +4504,7 @@ describe('thread_router forwardMessage startup-artifact handling', () => {
       const reply = await forwardMessage(
         3099,
         'hello',
-        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, emptyReprobeDelayMs: 1, emptyStableProbeLimit: 1 },
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, emptyReprobeDelayMs: 1, emptyStableProbeLimit: 1, candidateConfirmMs: 0 },
         meta,
       )
 
@@ -4415,7 +4534,7 @@ describe('thread_router forwardMessage startup-artifact handling', () => {
       const reply = await forwardMessage(
         3099,
         'hello',
-        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, emptyReprobeDelayMs: 1, emptyStableProbeLimit: 1 },
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, emptyReprobeDelayMs: 1, emptyStableProbeLimit: 1, candidateConfirmMs: 0 },
         meta,
       )
 
@@ -4515,7 +4634,7 @@ describe('thread_router forwardMessage html-intermediate handling', () => {
 
       const reply = await forwardMessage(
         3099, 'hello',
-        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0 },
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0, candidateConfirmMs: 0 },
         meta,
       )
 
@@ -4621,7 +4740,7 @@ describe('thread_router forwardMessage html-intermediate handling', () => {
 
       const reply = await forwardMessage(
         3099, 'hello',
-        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0 },
+        { fetch: fetchMock, cwd, claudeProjectsDir, includeSlackContext: false, statusPollMs: 1, messageSettleMs: 0, replyRepollMs: 0, candidateConfirmMs: 0 },
         meta,
       )
 

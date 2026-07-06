@@ -66,6 +66,7 @@ export interface ThreadRouterOptions {
   stableConfirmPolls?: number
   emptyReprobeDelayMs?: number
   emptyStableProbeLimit?: number
+  candidateConfirmMs?: number
   onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>
 }
 
@@ -147,6 +148,12 @@ const DEFAULT_STABLE_CONFIRM_POLLS = 3
 // confirmed-stable-and-empty probes (≈2–3 min) (opshub#155, 2026-07-05).
 const DEFAULT_EMPTY_REPROBE_DELAY_MS = 2_000
 const DEFAULT_EMPTY_STABLE_PROBE_LIMIT = 24
+// A JSONL-fallback candidate can be a MID-TURN narration captured during a
+// false stable (context summarization pause, quiet tool call). Before
+// finalizing it, require the worker to stay visibly idle and the candidate to
+// stay the transcript's last word for this long (2026-07-06 incident:
+// the turn's opening narration got finalized as the reply).
+const DEFAULT_CANDIDATE_CONFIRM_MS = 20_000
 // Drain-loop tunables: how long to wait between transient-error retries and
 // how long the drain window stays open before failing queued turns (opshub#155).
 const DEFAULT_QUEUE_DRAIN_POLL_MS = 5_000
@@ -494,6 +501,17 @@ export async function forwardMessage(
       `raw /messages len=${content.length}, agentapi sanitized len=${sanitized.length}, jsonl len=${sanitizedJsonl.length}`
     console.error(`[slack] ${diagnostic}`)
     routerLog(diagnostic, options.stateDir)
+    // Within the overall deadline, a candidate must survive confirmation (the
+    // worker may just be in a false-stable pause). At the deadline, deliver
+    // the transcript's last word as-is — best effort beats nothing.
+    if (sanitizedJsonl && jsonlFallbackState && nowFn() < overallDeadline) {
+      const confirmed = await confirmJsonlCandidate(port, jsonlFallbackState, sanitizedJsonl, options)
+      if (confirmed !== undefined) return appendContextUsageLine(confirmed, contextUsageLine)
+      // Worker resumed — the candidate was mid-turn narration. Re-enter the wait.
+      routerLog('jsonl candidate rejected (worker resumed); re-entering wait', options.stateDir)
+      stableEmptyProbes = 0
+      continue
+    }
     if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
 
     // Nothing anywhere yet. Worker still running (or settle bailed mid-run) —
@@ -814,7 +832,17 @@ async function fetchLatestClaudeJsonlAssistantText(
     const record = entry as Record<string, unknown>
 
     if (record['type'] === 'user' && record['isMeta'] !== true) {
-      sawPostedUser = true
+      // Tool results are also type 'user' but carry array content; only a real
+      // inbound turn (string content) opens — or closes — the scan window.
+      const message = record['message']
+      const isRealUserTurn = Boolean(message && typeof message === 'object' &&
+        typeof (message as Record<string, unknown>)['content'] === 'string')
+      if (isRealUserTurn) {
+        // A second inbound turn means our turn's window ended; never pick up
+        // the NEXT turn's reply into this one (queued-turn correctness).
+        if (sawPostedUser) break
+        sawPostedUser = true
+      }
       continue
     }
     if (record['type'] !== 'assistant') continue
@@ -855,6 +883,50 @@ function extractClaudeAssistantText(record: Record<string, unknown>): string {
 
 function isIgnoredClaudeAssistantText(text: string): boolean {
   return /^no response requested\.?$/i.test(text.trim())
+}
+
+// Progressive finalize (opshub#155, 2026-07-06): a JSONL-fallback candidate is
+// only trusted after the worker stays visibly idle AND the candidate stays the
+// transcript's last word for candidateConfirmMs. Returns the (possibly newer)
+// confirmed text, or undefined when the worker resumed — the caller re-enters
+// the wait loop and picks up the real final reply later.
+async function confirmJsonlCandidate(
+  port: number,
+  state: ClaudeJsonlFallbackState,
+  initial: string,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  const confirmMs = options.candidateConfirmMs ?? DEFAULT_CANDIDATE_CONFIRM_MS
+  if (confirmMs <= 0) return initial
+  const pollMs = Math.max(1, Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, 2_000))
+  let candidate = initial
+  let quietSince = Date.now()
+
+  while (true) {
+    await sleep(Math.min(pollMs, Math.max(1, quietSince + confirmMs - Date.now())))
+    try {
+      if ((await getAgentStatus(port, options)) === 'running') return undefined
+    } catch {
+      return candidate // status endpoint gone (worker restart?) — best effort
+    }
+    try {
+      // /status can report stable during quiet tool calls; a live TUI spinner
+      // line ("✶ Baking… (12s · esc to interrupt)") is the tell that the turn
+      // is still in flight.
+      const content = await fetchLatestAgentMessageContent(port, options)
+      if (content && latestStatusLine(content) !== undefined) return undefined
+    } catch {
+      // /messages hiccup: fall through to the transcript check
+    }
+    const latest = await fetchLatestClaudeJsonlAssistantText(state)
+    const sanitizedLatest = latest ? sanitizeAgentReply(latest) : ''
+    if (sanitizedLatest && sanitizedLatest !== candidate) {
+      candidate = sanitizedLatest // newer text wins; restart the quiet window
+      quietSince = Date.now()
+      continue
+    }
+    if (Date.now() - quietSince >= confirmMs) return candidate
+  }
 }
 
 async function waitForSettledAgentMessageContent(
