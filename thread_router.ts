@@ -201,6 +201,13 @@ const TUI_HTML_TOOL_RESULT_RE = /^[ \t]*<(?:details|summary|\/details|\/summary)
 // Slack inbound echo and contains durable background-task/transcript markers.
 const STALE_TUI_SCROLLBACK_RE =
   /\bAgent\b.*\bresumed from transcript\b|\bBackground command\b.*\bcompleted\b|\bOutput:\s*\/tmp\/claude-[^\n]*\/tasks\/[^\n]*output\b/i
+// Bash commands where the thread worker attempts to send a Slack reply itself
+// (e.g. `claude mcp call slack reply …` or `claude mcp __batchCalls …`).  The
+// thread router is the sole Slack outbound sender; these always fail with
+// "unknown command" but leave the worker stuck in a tool-call error loop.
+// Detected in the JSONL scan to short-circuit extraction and deliver the real
+// answer before the loop wedges the router (opshub#155, 2026-07-08).
+const SLACK_SELF_SEND_RE = /\bclaude\s+mcp\s+(?:call|__batchCalls)\b/i
 
 const inFlight = new Map<string, Promise<ThreadSession>>()
 
@@ -416,6 +423,14 @@ export async function forwardMessage(
     body: JSON.stringify({ content: forwardedContent, type: 'user' }),
   }, options)
 
+  // Self-send abort: when the JSONL scan detects a self-send tool-call (the
+  // worker tried to deliver via `claude mcp call`), the turn is effectively
+  // complete — abort the wait-for-stable loop so the real answer is delivered
+  // instead of blocking for 24h on a worker stuck in an error loop (opshub#155).
+  const shouldAbortWait = jsonlFallbackState
+    ? async () => (await scanClaudeJsonlTurnReply(jsonlFallbackState)).turnComplete
+    : undefined
+
   // All-paths-empty extraction re-probes instead of finalizing (opshub#155,
   // 2026-07-05 incident): a worker at high context usage summarizes its window
   // BEFORE emitting the first token of a turn, and agentapi reports a
@@ -453,7 +468,27 @@ export async function forwardMessage(
       }
     }
 
-    await waitForStable(port, options, options.onHeartbeat)
+    await waitForStable(port, options, options.onHeartbeat, shouldAbortWait)
+
+    // Post-wait JSONL check: if the turn completed during the wait (self-send
+    // detection or next turn opened), deliver immediately without settling —
+    // the worker is in an error loop or already processing the next turn and
+    // won't produce meaningful /messages content for THIS turn (opshub#155).
+    if (jsonlFallbackState) {
+      const postWaitScan = await scanClaudeJsonlTurnReply(jsonlFallbackState)
+      const sanitizedPostWait = postWaitScan.text ? sanitizeAgentReply(postWaitScan.text) : ''
+      if (postWaitScan.turnComplete && sanitizedPostWait) {
+        let contextLine: string | undefined
+        try {
+          const latest = await fetchLatestAgentMessageContent(port, options)
+          contextLine = latest ? latestContextUsageLine(latest) : undefined
+        } catch {
+          /* best effort */
+        }
+        routerLog('turn completed during wait (self-send or next turn); delivering final reply', options.stateDir)
+        return appendContextUsageLine(sanitizedPostWait, contextLine)
+      }
+    }
 
     const settled = await waitForSettledAgentMessageContent(port, options)
     let content = settled.content
@@ -893,6 +928,14 @@ async function scanClaudeJsonlTurnReply(
 
     const assistantText = extractClaudeAssistantText(record)
     if (assistantText && !isIgnoredClaudeAssistantText(assistantText)) latestText = assistantText
+    // Self-send detection: a tool_use(Bash: "claude mcp call/batchCalls") means
+    // the worker tried to deliver the reply itself.  The text portion of THIS
+    // record is the real answer; everything after is error-loop noise.  Mark the
+    // turn complete so the router delivers immediately (opshub#155, 2026-07-08).
+    if (containsSlackSelfSendToolUse(record)) {
+      turnComplete = true
+      break
+    }
   }
 
   return { text: latestText, turnComplete }
@@ -921,6 +964,24 @@ function extractClaudeAssistantText(record: Record<string, unknown>): string {
 
 function isIgnoredClaudeAssistantText(text: string): boolean {
   return /^no response requested\.?$/i.test(text.trim())
+}
+
+export function containsSlackSelfSendToolUse(record: Record<string, unknown>): boolean {
+  const message = record['message']
+  if (!message || typeof message !== 'object') return false
+  const content = (message as Record<string, unknown>)['content']
+  if (!Array.isArray(content)) return false
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue
+    const p = part as Record<string, unknown>
+    if (p['type'] !== 'tool_use') continue
+    const input = p['input']
+    if (!input || typeof input !== 'object') continue
+    const command = (input as Record<string, unknown>)['command']
+    if (typeof command === 'string' && SLACK_SELF_SEND_RE.test(command)) return true
+  }
+  return false
 }
 
 // Progressive finalize (opshub#155, 2026-07-06): a JSONL-fallback candidate is
@@ -1287,6 +1348,7 @@ export function buildSlackContextPrompt(meta: Record<string, string>): string {
   return [
     `<slack_context ${renderedAttrs}>`,
     'You are replying in this Slack thread. Answer concisely for Slack.',
+    'Your text output IS the Slack reply — the thread router forwards it automatically. Do NOT attempt to send messages yourself via claude mcp, Bash curl/API calls, or any CLI command.',
     'If attachment_paths is present, inspect those local files with Read/Bash as needed before answering.',
     'If context, history, search results, or attachments are missing, say what to fetch instead of assuming.',
     '</slack_context>',
@@ -1635,6 +1697,7 @@ async function waitForStable(
   port: number,
   options: ThreadRouterOptions,
   onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>,
+  shouldAbort?: () => Promise<boolean>,
 ): Promise<void> {
   const now = options.now || Date.now
   const deadline = now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
@@ -1645,6 +1708,10 @@ async function waitForStable(
   let sawStable = false
 
   while (now() <= deadline) {
+    // Early exit when the JSONL scan shows the turn completed (e.g. self-send
+    // tool-call detected) — the real answer is already available and the worker
+    // is stuck in an error loop that will never settle (opshub#155, 2026-07-08).
+    if (shouldAbort && await shouldAbort()) return
     const status = await getAgentStatus(port, options)
     if (status === 'stable') {
       sawStable = true

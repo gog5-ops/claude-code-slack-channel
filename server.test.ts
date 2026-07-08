@@ -53,6 +53,7 @@ import {
   replyIsStartupArtifact,
   replyLooksLikeHtmlIntermediate,
   runDeliveryDrainLoop,
+  containsSlackSelfSendToolUse,
   sanitizeAgentReply,
   sessionKeyFromMeta,
   stateFilePathForKey,
@@ -2249,6 +2250,7 @@ describe('thread_router forwardMessage', () => {
     expect(prompt).toContain('attachment_count="0"')
     expect(prompt).toContain('You are replying in this Slack thread')
     expect(prompt).toContain('Answer concisely for Slack')
+    expect(prompt).toContain('Do NOT attempt to send messages yourself via claude mcp')
     expect(prompt).toContain('say what to fetch instead of assuming')
     expect(prompt).not.toContain('attachment_paths=')
   })
@@ -3585,6 +3587,160 @@ describe('thread_router forwardMessage', () => {
     }
   }, 3_000)
 
+  test('extracts real answer when worker enters self-send tool-call loop (opshub#155)', async () => {
+    // 2026-07-08 live incident: the worker generated a valid reply then tried
+    // to deliver it itself via `claude mcp call slack reply`, which failed with
+    // "unknown command 'call'". It retried in a loop, staying permanently
+    // 'running'. The router's JSONL candidate confirmation rejected every
+    // candidate ("worker resumed"), livelocking until the 24h forward deadline.
+    //
+    // Fix: scanClaudeJsonlTurnReply detects the self-send tool_use and marks
+    // the turn complete; shouldAbort exits waitForStable; the post-wait JSONL
+    // check delivers the real pre-self-send answer immediately.
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-self-send-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'D0ATZTYC3KN',
+      thread_ts: '1783472330.749389',
+      ts: '1783472330.749390',
+      message_id: '1783472330.749390',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/message')) {
+          // Simulates the JSONL after the worker processes the turn: real
+          // answer text + self-send tool_use, then error, then retry.
+          writeFileSync(
+            jsonlPath,
+            [
+              // The forwarded user turn
+              JSON.stringify({
+                type: 'user',
+                timestamp: new Date().toISOString(),
+                message: { role: 'user', content: '提取一下剧本格式' },
+              }),
+              // Worker's real answer + self-send attempt in the same message
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(Date.now() + 5).toISOString(),
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [
+                    { type: 'text', text: '以下是剧本格式的提取结果：\n\n1. 标题\n2. 角色\n3. 场景' },
+                    {
+                      type: 'tool_use',
+                      id: 'toolu_abc123',
+                      name: 'Bash',
+                      input: {
+                        command: 'claude mcp call slack reply \'{"chat_id":"D0ATZTYC3KN","text":"以下是剧本格式..."}\'',
+                      },
+                    },
+                  ],
+                },
+              }),
+              // Tool result error
+              JSON.stringify({
+                type: 'user',
+                timestamp: new Date(Date.now() + 10).toISOString(),
+                message: {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'tool_result',
+                      tool_use_id: 'toolu_abc123',
+                      content: "error: unknown command 'call'",
+                      is_error: true,
+                    },
+                  ],
+                },
+              }),
+              // Worker's retry attempt with error-handling text
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(Date.now() + 15).toISOString(),
+                message: {
+                  model: 'claude-opus-4-6',
+                  role: 'assistant',
+                  content: [
+                    { type: 'text', text: 'Let me try a different approach to send this...' },
+                    {
+                      type: 'tool_use',
+                      id: 'toolu_def456',
+                      name: 'Bash',
+                      input: { command: 'claude mcp __batchCalls \'[{"tool":"reply"}]\'' },
+                    },
+                  ],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          // Worker stays permanently running (stuck in tool-call error loop)
+          return new Response(JSON.stringify({ status: 'running' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          // /messages shows TUI spinner noise from the error loop
+          return new Response(
+            JSON.stringify({
+              messages: [{
+                id: 2,
+                role: 'agent',
+                content: "✶ Running bash command… (5s · esc to interrupt)\nerror: unknown command 'call'\n48% context used",
+                time: '2026-07-08T00:00:01.000Z',
+              }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        '提取一下剧本格式',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+          emptyReprobeDelayMs: 1,
+          emptyStableProbeLimit: 50,
+          candidateConfirmMs: 20,
+          forwardTimeoutMs: 5_000,
+        },
+        meta,
+      )
+
+      // Must return the REAL answer (before self-send), not the error-handling text
+      expect(reply).toContain('以下是剧本格式的提取结果')
+      expect(reply).toContain('1. 标题')
+      expect(reply).not.toContain('Let me try a different approach')
+      expect(reply).not.toContain('unknown command')
+      expect(reply).toContain('48% context used')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  }, 10_000)
+
   test('falls back to Claude project JSONL when AgentAPI latest agent message is stale background-task TUI scrollback', async () => {
     const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-stale-tui-jsonl-'))
     const cwd = join(rawRoot, 'repo')
@@ -4506,6 +4662,97 @@ describe('thread_router replyIsStartupArtifact', () => {
 
   test('does not flag a reply that merely mentions /doctor in prose', () => {
     expect(replyIsStartupArtifact('Run /doctor to check your setup when you get a chance.')).toBe(false)
+  })
+})
+
+describe('thread_router containsSlackSelfSendToolUse (opshub#155)', () => {
+  test('detects claude mcp call in Bash tool_use', () => {
+    const record = {
+      type: 'assistant',
+      message: {
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Here is the answer' },
+          {
+            type: 'tool_use',
+            id: 'toolu_abc123',
+            name: 'Bash',
+            input: { command: "claude mcp call slack reply '{\"chat_id\":\"D0A\",\"text\":\"answer\"}'" },
+          },
+        ],
+      },
+    }
+    expect(containsSlackSelfSendToolUse(record)).toBe(true)
+  })
+
+  test('detects claude mcp __batchCalls in Bash tool_use', () => {
+    const record = {
+      type: 'assistant',
+      message: {
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Let me send this' },
+          {
+            type: 'tool_use',
+            id: 'toolu_def456',
+            name: 'Bash',
+            input: { command: 'claude mcp __batchCalls \'[{"tool":"reply","args":{}}]\'' },
+          },
+        ],
+      },
+    }
+    expect(containsSlackSelfSendToolUse(record)).toBe(true)
+  })
+
+  test('does not flag normal Bash tool_use', () => {
+    const record = {
+      type: 'assistant',
+      message: {
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Running a build' },
+          { type: 'tool_use', id: 'toolu_xyz', name: 'Bash', input: { command: 'npm test' } },
+        ],
+      },
+    }
+    expect(containsSlackSelfSendToolUse(record)).toBe(false)
+  })
+
+  test('does not flag text-only assistant messages', () => {
+    const record = {
+      type: 'assistant',
+      message: {
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Here is a plain answer' }],
+      },
+    }
+    expect(containsSlackSelfSendToolUse(record)).toBe(false)
+  })
+
+  test('does not flag string content (no tool_use blocks)', () => {
+    const record = {
+      type: 'assistant',
+      message: { model: 'claude-opus-4-6', role: 'assistant', content: 'just text' },
+    }
+    expect(containsSlackSelfSendToolUse(record)).toBe(false)
+  })
+
+  test('does not flag Read/Write/Edit tool_use', () => {
+    const record = {
+      type: 'assistant',
+      message: {
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_r', name: 'Read', input: { file_path: '/tmp/test.ts' } },
+        ],
+      },
+    }
+    expect(containsSlackSelfSendToolUse(record)).toBe(false)
   })
 })
 
