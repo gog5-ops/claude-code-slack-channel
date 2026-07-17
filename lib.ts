@@ -1032,13 +1032,15 @@ export const SLASH_BRIDGE_COMMANDS = new Set(['usage'])
 /**
  * Parse a Slack message that should become a Claude Code slash command.
  *
- * Accepts `#usage` or `/usage` (optional surrounding whitespace only).
+ * Requires the two-character prefix `#/` (e.g. `#/usage`). A lone `#usage`
+ * or `/usage` is intentionally not matched so normal chat and Claude-style
+ * single-slash text stay ordinary messages.
  * Returns the lowercased command name when it is on the whitelist; otherwise
  * undefined so the message falls through to normal chat delivery.
  */
 export function parseSlashBridgeCommand(text: string): string | undefined {
   const trimmed = text.trim()
-  const match = /^(?:#|\/)([a-z][a-z0-9_-]{0,31})\s*$/i.exec(trimmed)
+  const match = /^#\/([a-z][a-z0-9_-]{0,31})\s*$/i.exec(trimmed)
   if (!match) return undefined
   const name = match[1].toLowerCase()
   return SLASH_BRIDGE_COMMANDS.has(name) ? name : undefined

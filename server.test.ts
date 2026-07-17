@@ -633,16 +633,17 @@ describe('parseSendableRoots', () => {
 // ---------------------------------------------------------------------------
 
 describe('parseSlashBridgeCommand', () => {
-  test('accepts #usage and /usage', () => {
-    expect(parseSlashBridgeCommand('#usage')).toBe('usage')
-    expect(parseSlashBridgeCommand('/usage')).toBe('usage')
-    expect(parseSlashBridgeCommand('  #Usage  ')).toBe('usage')
+  test('accepts #/usage only (both symbols required)', () => {
+    expect(parseSlashBridgeCommand('#/usage')).toBe('usage')
+    expect(parseSlashBridgeCommand('  #/Usage  ')).toBe('usage')
   })
 
-  test('rejects unknown and free-form commands', () => {
-    expect(parseSlashBridgeCommand('#exit')).toBeUndefined()
-    expect(parseSlashBridgeCommand('/clear')).toBeUndefined()
-    expect(parseSlashBridgeCommand('#usage please')).toBeUndefined()
+  test('rejects single-prefix, unknown, and free-form commands', () => {
+    expect(parseSlashBridgeCommand('#usage')).toBeUndefined()
+    expect(parseSlashBridgeCommand('/usage')).toBeUndefined()
+    expect(parseSlashBridgeCommand('#/exit')).toBeUndefined()
+    expect(parseSlashBridgeCommand('#/clear')).toBeUndefined()
+    expect(parseSlashBridgeCommand('#/usage please')).toBeUndefined()
     expect(parseSlashBridgeCommand('usage')).toBeUndefined()
     expect(parseSlashBridgeCommand('!usage')).toBeUndefined()
   })
