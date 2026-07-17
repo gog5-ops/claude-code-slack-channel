@@ -1,0 +1,2097 @@
+import { spawn as nodeSpawn, type ChildProcess } from 'child_process'
+import { createHash } from 'crypto'
+import { appendFile, chmod, mkdir, readFile, rename, stat, unlink, writeFile } from 'fs/promises'
+import { existsSync } from 'fs'
+import { homedir } from 'os'
+import { dirname, join, resolve } from 'path'
+import { createServer } from 'net'
+
+export type ThreadSessionStatus = 'activating' | 'active' | 'archived' | 'dead'
+
+export interface ThreadSession {
+  session_id: string
+  port: number
+  pid: number
+  status: ThreadSessionStatus
+  created_at: string
+  last_active_at: string
+  cwd: string
+  slack_context_sent_at?: string
+}
+
+export type ThreadSessionRegistry = Record<string, ThreadSession>
+
+export interface SpawnedProcess {
+  pid?: number
+  unref?: () => void
+}
+
+export type SpawnAgent = (
+  command: string,
+  args: string[],
+  options: { cwd: string; detached: true; stdio: 'ignore'; env: NodeJS.ProcessEnv },
+) => SpawnedProcess
+
+export interface BuildAgentapiCommandOptions {
+  cwd?: string
+  claudeProjectsDir?: string
+  sessionJsonlExists?: (path: string) => boolean
+  model?: string
+  systemPromptFile?: string
+}
+
+export interface ThreadRouterOptions {
+  stateDir?: string
+  agentapiPath?: string
+  basePort?: number
+  maxPorts?: number
+  cwd?: string
+  now?: () => number
+  fetch?: (input: string, init?: RequestInit) => Promise<Response>
+  spawnAgent?: SpawnAgent
+  portIsAvailable?: (port: number) => Promise<boolean>
+  pidIsAlive?: (pid: number) => boolean
+  killProcess?: (pid: number) => void | Promise<void>
+  lockTimeoutMs?: number
+  lockPollMs?: number
+  activationTimeoutMs?: number
+  statusPollMs?: number
+  forwardTimeoutMs?: number
+  messageSettleMs?: number
+  messagePostRetryMs?: number
+  replyRepollMs?: number
+  includeSlackContext?: boolean
+  claudeProjectsDir?: string
+  heartbeatMs?: number
+  stableConfirmPolls?: number
+  emptyReprobeDelayMs?: number
+  emptyStableProbeLimit?: number
+  candidateConfirmMs?: number
+  onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>
+}
+
+interface AgentStatusBody {
+  status?: unknown
+}
+
+interface AgentMessage {
+  id: number
+  role: 'agent' | 'user'
+  content: string
+  time: string
+}
+
+interface MessagesBody {
+  messages?: AgentMessage[]
+}
+
+interface ClaudeJsonlFallbackState {
+  path: string
+  lineCount: number
+  // Wall-clock delivery time. Post-summarization transcripts can reshape the
+  // delivered user record, so the assistant-text scan also accepts records
+  // provably written after delivery (opshub#155).
+  deliveredAtMs?: number
+}
+
+// A Slack turn queued while the per-thread worker was busy. Drained FIFO once
+// the worker becomes ready (opshub#155).
+export interface QueuedTurn {
+  text: string
+  meta: Record<string, string>
+  progressTs: string | undefined
+  enqueuedAt: number
+}
+
+const DEFAULT_BASE_PORT = 3010
+const DEFAULT_MAX_PORTS = 90
+const DEFAULT_LOCK_TIMEOUT_MS = 10_000
+const DEFAULT_LOCK_POLL_MS = 50
+const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000
+const DEFAULT_STATUS_POLL_MS = 1_000
+// Ceiling for a single forward: how long waitForStable waits for a worker to go
+// running → stable (and the settle loop's overall cap). This must exceed the
+// longest a healthy worker can legitimately stay busy on one turn, or a long
+// in-flight task (the live opshub#155 case: a ~3h47m download job) trips the old
+// 15-minute bound and is misclassified as a 'fatal' delivery failure, surfacing
+// the same "Failed to deliver" notice as the queue bug. 24h matches the queue
+// TTL/drain bound (server.ts). A dead/unreachable worker still fast-fails inside
+// one poll because getAgentStatus throws (ECONNREFUSED / unexpected status) —
+// the timeout only governs a worker that stays reachably 'running'.
+const DEFAULT_FORWARD_TIMEOUT_MS = 24 * 60 * 60 * 1000
+const DEFAULT_MESSAGE_SETTLE_MS = 750
+const DEFAULT_HEARTBEAT_MS = 30_000
+const DEFAULT_MESSAGE_SETTLE_POLL_MS = 250
+// Window for retrying the transient "agent is not waiting for user input" POST
+// race after a worker spawn/recycle. A freshly spawned Claude worker can take
+// tens of seconds to load context/MCP before it reaches the input prompt, so
+// this matches the activation-timeout magnitude rather than the old 5s, which
+// was too short post-recycle (opshub#155, Phase 5 follow-up).
+const DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS = 30_000
+const DEFAULT_MESSAGE_POST_RETRY_POLL_MS = 250
+// Budget for re-polling /messages when it settles empty/context-only after the
+// agent is stable. agentapi can briefly lag the final assistant text behind the
+// stable status; re-polling recovers the real reply instead of falling back to a
+// possibly-partial JSONL (opshub#155, Phase 5 follow-up).
+const DEFAULT_REPLY_REPOLL_MS = 3_000
+// Context compaction can cause a brief false "stable" before the agent resumes
+// processing in a new context window.  Require this many consecutive stable
+// polls before waitForStable returns.  Expressed as a poll count (not wall-
+// clock time) so it scales with statusPollMs and tests with statusPollMs: 1
+// stay fast.  3 × 1 000 ms = 3 s confirmation window in production.
+const DEFAULT_STABLE_CONFIRM_POLLS = 3
+// A worker at high context usage summarizes its window BEFORE emitting the
+// first token of a turn; agentapi reports 'stable' during that pause, so an
+// all-paths-empty extraction usually means "turn not actually started or
+// finished yet", not "turn produced no reply". forwardMessage re-probes
+// instead of finalizing; it only gives up after this many consecutive
+// confirmed-stable-and-empty probes (≈2–3 min) (opshub#155, 2026-07-05).
+const DEFAULT_EMPTY_REPROBE_DELAY_MS = 2_000
+const DEFAULT_EMPTY_STABLE_PROBE_LIMIT = 24
+// A JSONL-fallback candidate can be a MID-TURN narration captured during a
+// false stable (context summarization pause, quiet tool call). Before
+// finalizing it, require the worker to stay visibly idle and the candidate to
+// stay the transcript's last word for this long (2026-07-06 incident:
+// the turn's opening narration got finalized as the reply).
+const DEFAULT_CANDIDATE_CONFIRM_MS = 20_000
+// Drain-loop tunables: how long to wait between transient-error retries and
+// how long the drain window stays open before failing queued turns (opshub#155).
+const DEFAULT_QUEUE_DRAIN_POLL_MS = 5_000
+const DEFAULT_QUEUE_TTL_MS = 20 * 60_000
+const DEFAULT_QUEUE_DRAIN_TIMEOUT_MS = 20 * 60_000
+const DEFAULT_CLAUDE_MODEL = 'claude-opus-4-6'
+const DEFAULT_CLAUDE_FALLBACK_MODEL = 'claude-opus-4-8'
+const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9:._-]+$/
+const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g
+const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
+const TUI_PREFIX_RE = /^[ \t]*[●⏺]\s*/
+const TUI_TIMED_STATUS_RE =
+  /^[✻✶✱✢]\s+.*\bfor\s+\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b/i
+const TUI_TOOL_STATUS_RE = /^(?:Ran|Searched|Called)\b(?:\s|:|$)/
+const TUI_TRANSIENT_STATUS_RE = /^[✻✶✱✢]?\s*(?:Ruminating|Thinking)(?:…|\.\.\.)(?:\s|$|\()/i
+// Live Claude Code spinner status line ("✶ Ruminating… (51s · esc to interrupt)")
+// and the gerund verb within it. Used by the progress heartbeat to surface the
+// current visible status instead of a generic label (opshub#155, Phase 5).
+const TUI_STATUS_GLYPH_RE = /^[✻✶✱✢]\s/
+const HEARTBEAT_STATUS_VERB_RE = /[✻✶✱✢*]?\s*([A-Za-z][A-Za-z ]*?)\s*(?:…|\.{3})/
+const SLACK_INBOUND_ECHO_RE = /^←\s*slack\s*·\s*/i
+const SLACK_ECHO_CONTINUATION_RE = /^.{1,32}…$/
+const CONTEXT_USAGE_RE = /^(\d+%)\s+context used$/i
+const CONTEXT_USAGE_ANYWHERE_RE = /(\d+%)\s+context used/gi
+const MARKDOWN_LINE_PREFIX_RE = /^([ \t]{0,3}(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]?))/
+const EXCESS_HORIZONTAL_SPACE_RE = /[ \t]{2,}/g
+const CLAUDE_PROJECT_SAFE_CHAR_RE = /[^A-Za-z0-9_-]/g
+const CLAUDE_SESSION_ALREADY_IN_USE_RE = /Error:\s+Session ID [0-9a-f-]+ is already in use\./i
+const CLAUDE_UNKNOWN_PROVIDER_RE = /unknown provider for model\s+\S+/i
+const AGENT_WAITING_FOR_USER_INPUT_RE = /message can only be sent when the agent is waiting for user input/i
+// Signatures of the Claude startup / setup / context-index TUI screen that a
+// fresh worker shows before it has replied to the just-posted message. These
+// survive sanitizeAgentReply, so we detect them to avoid posting them as a
+// reply. Captured from a real worker .state file (opshub#155, Phase 5).
+const STARTUP_ARTIFACT_RE =
+  /SessionStart:|Settings Warning|\bsetup issues:|Context Index:|\$CMEM\b|❯\s*\d+\.\s|^[ \t]*[─━]{20,}[ \t]*$/m
+// HTML-rendered tool-call result blocks emitted by the Claude Code TUI inside
+// agentapi /messages content. Claude Code collapses tool outputs into expandable
+// <details>/<summary> elements; these survive sanitizeAgentReply (which only strips
+// glyph-prefixed lines) and must never be posted to Slack as the final reply.
+const TUI_HTML_TOOL_RESULT_RE = /^[ \t]*<(?:details|summary|\/details|\/summary)\b/i
+// Stale Claude Code TUI scrollback sometimes appears as the latest AgentAPI
+// agent message after a resumed background task. It can sanitize to plausible
+// prose (for example an old final reply), but it is not bounded by the current
+// Slack inbound echo and contains durable background-task/transcript markers.
+const STALE_TUI_SCROLLBACK_RE =
+  /\bAgent\b.*\bresumed from transcript\b|\bBackground command\b.*\bcompleted\b|\bOutput:\s*\/tmp\/claude-[^\n]*\/tasks\/[^\n]*output\b/i
+// Bash commands where the thread worker attempts to send a Slack reply itself
+// (e.g. `claude mcp call slack reply …` or `claude mcp __batchCalls …`).  The
+// thread router is the sole Slack outbound sender; these always fail with
+// "unknown command" but leave the worker stuck in a tool-call error loop.
+// Detected in the JSONL scan to short-circuit extraction and deliver the real
+// answer before the loop wedges the router (opshub#155, 2026-07-08).
+const SLACK_SELF_SEND_RE = /\bclaude\s+mcp\s+(?:call|__batchCalls)\b/i
+
+const inFlight = new Map<string, Promise<ThreadSession>>()
+
+export function defaultStateDir(): string {
+  return process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
+}
+
+export function registryFilePath(stateDir = defaultStateDir()): string {
+  return join(stateDir, 'thread_sessions.json')
+}
+
+export function registryLockPath(stateDir = defaultStateDir()): string {
+  return `${registryFilePath(stateDir)}.lock`
+}
+
+export function buildSessionKey(channel: string, threadTs: string): string {
+  if (!channel) throw new Error('buildSessionKey: channel is required')
+  if (!threadTs) throw new Error('buildSessionKey: thread timestamp is required')
+  return `${channel}:${threadTs}`
+}
+
+export function sessionKeyFromMeta(meta: Record<string, string>): string {
+  const channel = meta['chat_id']
+  const threadTs = meta['thread_ts'] || meta['ts']
+  if (!channel) throw new Error('sessionKeyFromMeta: meta.chat_id is required')
+  if (!threadTs) throw new Error('sessionKeyFromMeta: meta.thread_ts or meta.ts is required')
+  return buildSessionKey(channel, threadTs)
+}
+
+export function stateFilePathForKey(stateDir: string, key: string): string {
+  if (!SAFE_SESSION_KEY_RE.test(key)) {
+    throw new Error(`stateFilePathForKey: invalid session key: ${JSON.stringify(key)}`)
+  }
+  return join(stateDir, 'sessions', `${key}.state`)
+}
+
+export function claudeSessionIdForKey(key: string): string {
+  const hex = createHash('sha256').update(`slack-thread:${key}`).digest('hex')
+  const variant = ((parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16)
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    `5${hex.slice(13, 16)}`,
+    `${variant}${hex.slice(17, 20)}`,
+    hex.slice(20, 32),
+  ].join('-')
+}
+
+export function claudeProjectSessionJsonlPath(
+  cwd: string,
+  sessionId: string,
+  claudeProjectsDir = join(homedir(), '.claude', 'projects'),
+): string {
+  const projectName = resolve(cwd).replace(CLAUDE_PROJECT_SAFE_CHAR_RE, '-')
+  return join(claudeProjectsDir, projectName, `${sessionId}.jsonl`)
+}
+
+export function buildAgentapiCommand(
+  port: number,
+  key: string,
+  stateDir = defaultStateDir(),
+  agentapiPath = join(homedir(), 'bin', 'agentapi'),
+  options: BuildAgentapiCommandOptions = {},
+): { command: string; args: string[]; stateFile: string; claudeSessionId: string } {
+  const stateFile = stateFilePathForKey(stateDir, key)
+  const claudeSessionId = claudeSessionIdForKey(key)
+  const model = options.model || threadClaudeModel()
+  const sessionJsonl = claudeProjectSessionJsonlPath(
+    options.cwd || process.cwd(),
+    claudeSessionId,
+    options.claudeProjectsDir,
+  )
+  const sessionJsonlExists = options.sessionJsonlExists || existsSync
+  const sessionArgs = sessionJsonlExists(sessionJsonl)
+    ? ['--resume', claudeSessionId]
+    : ['--session-id', claudeSessionId]
+
+  // Full-replace the system prompt for the Opus 4.8 tier only. agentapi forwards
+  // post-`--` args straight to Claude, and `--system-prompt-file` is honored in
+  // the interactive (non-`-p`) launch. 4.6 — or any model without a configured
+  // file — keeps Claude Code's default prompt untouched.
+  const systemPromptFile =
+    options.systemPromptFile ?? process.env['SLACK_THREAD_SYSTEM_PROMPT_FILE']
+  const systemPromptArgs =
+    systemPromptFile && /opus-4-8/.test(model)
+      ? ['--system-prompt-file', systemPromptFile]
+      : []
+
+  // agentapi v0.12.2 rejects server-level --session-id. Claude accepts only
+  // UUID session IDs, so the thread key is carried by the state file/name and
+  // a deterministic UUID is used for Claude's session identity. Once Claude has
+  // created the JSONL for that UUID, later starts must resume it instead.
+  return {
+    command: agentapiPath,
+    args: [
+      'server',
+      'claude',
+      '-p',
+      String(port),
+      '--state-file',
+      stateFile,
+      '--',
+      ...sessionArgs,
+      '--name',
+      key,
+      '--model',
+      model,
+      ...systemPromptArgs,
+      '--effort',
+      'max',
+      '--allowedTools',
+      'Read Edit Write Bash',
+    ],
+    stateFile,
+    claudeSessionId,
+  }
+}
+
+export function threadClaudeModel(): string {
+  return process.env['SLACK_THREAD_CLAUDE_MODEL'] || DEFAULT_CLAUDE_MODEL
+}
+
+export function threadClaudeFallbackModel(): string {
+  return process.env['SLACK_THREAD_CLAUDE_FALLBACK_MODEL'] || DEFAULT_CLAUDE_FALLBACK_MODEL
+}
+
+export async function readRegistryFile(path: string): Promise<ThreadSessionRegistry> {
+  if (!existsSync(path)) return {}
+  const raw = await readFile(path, 'utf8')
+  if (!raw.trim()) return {}
+  const parsed = JSON.parse(raw) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('thread session registry must be a JSON object')
+  }
+  return parsed as ThreadSessionRegistry
+}
+
+export async function writeRegistryAtomic(
+  path: string,
+  registry: ThreadSessionRegistry,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  const tmp = `${path}.tmp.${process.pid}`
+  const json = JSON.stringify(registry, null, 2)
+
+  try {
+    await writeFile(tmp, json, { mode: 0o600, flag: 'wx' })
+    await chmod(tmp, 0o600)
+    await rename(tmp, path)
+  } catch (err) {
+    try {
+      await unlink(tmp)
+    } catch {
+      /* no-op */
+    }
+    throw err
+  }
+}
+
+export async function readRegistry(stateDir = defaultStateDir()): Promise<ThreadSessionRegistry> {
+  return withRegistryLock(stateDir, async () => readRegistryFile(registryFilePath(stateDir)))
+}
+
+export async function writeRegistry(
+  stateDir: string,
+  registry: ThreadSessionRegistry,
+): Promise<void> {
+  await withRegistryLock(stateDir, async () => {
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+  })
+}
+
+export async function ensureSession(
+  channel: string,
+  threadTs: string,
+  options: ThreadRouterOptions = {},
+): Promise<ThreadSession> {
+  const stateDir = options.stateDir || defaultStateDir()
+  const key = buildSessionKey(channel, threadTs)
+  const flightKey = `${stateDir}\0${key}`
+  const existing = inFlight.get(flightKey)
+  if (existing) return existing
+
+  const promise = ensureSessionUnshared(key, options, stateDir)
+  inFlight.set(flightKey, promise)
+  try {
+    return await promise
+  } finally {
+    inFlight.delete(flightKey)
+  }
+}
+
+export async function forwardMessage(
+  port: number,
+  text: string,
+  options: ThreadRouterOptions = {},
+  meta?: Record<string, string>,
+): Promise<string> {
+  const fetchImpl = options.fetch || fetch
+  const baseUrl = `http://127.0.0.1:${port}`
+  const forwardedContent = meta
+    ? formatForwardedMessage(text, meta, {
+      includeSlackContext: options.includeSlackContext ?? true,
+    })
+    : text
+  const jsonlFallbackState = meta
+    ? await captureClaudeJsonlFallbackState(meta, options)
+    : undefined
+
+  await postAgentMessageWithRetry(fetchImpl, `${baseUrl}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: forwardedContent, type: 'user' }),
+  }, options)
+
+  // Self-send abort: when the JSONL scan detects a self-send tool-call (the
+  // worker tried to deliver via `claude mcp call`), the turn is effectively
+  // complete — abort the wait-for-stable loop so the real answer is delivered
+  // instead of blocking for 24h on a worker stuck in an error loop (opshub#155).
+  const shouldAbortWait = jsonlFallbackState
+    ? async () => (await scanClaudeJsonlTurnReply(jsonlFallbackState)).turnComplete
+    : undefined
+
+  // All-paths-empty extraction re-probes instead of finalizing (opshub#155,
+  // 2026-07-05 incident): a worker at high context usage summarizes its window
+  // BEFORE emitting the first token of a turn, and agentapi reports a
+  // confirmed 'stable' during that pause. The old single-shot flow finalized
+  // the placeholder as a bare context line within the first minute and nobody
+  // ever came back for the real reply. Give up only after the worker has been
+  // confirmed stable-and-empty repeatedly, or the overall deadline passes.
+  const nowFn = options.now || Date.now
+  const overallDeadline = nowFn() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
+  const reprobeDelayMs = Math.max(1, options.emptyReprobeDelayMs ?? DEFAULT_EMPTY_REPROBE_DELAY_MS)
+  const stableEmptyLimit = Math.max(1, options.emptyStableProbeLimit ?? DEFAULT_EMPTY_STABLE_PROBE_LIMIT)
+  let stableEmptyProbes = 0
+
+  while (true) {
+    // A later real inbound turn recorded in the session JSONL proves this
+    // turn's window closed — its last assistant text IS the final reply.
+    // Deliver before waiting for worker quiet: with turns queued back-to-back
+    // the worker re-enters 'running' within a second of finishing each turn,
+    // the candidate-confirm quiet window never elapses, and every finished
+    // reply would otherwise be rejected as "worker resumed" until the forward
+    // deadline (opshub#155 livelock, 2026-07-06).
+    if (jsonlFallbackState) {
+      const scan = await scanClaudeJsonlTurnReply(jsonlFallbackState)
+      const sanitizedScan = scan.text ? sanitizeAgentReply(scan.text) : ''
+      if (scan.turnComplete && sanitizedScan) {
+        let contextLine: string | undefined
+        try {
+          const latest = await fetchLatestAgentMessageContent(port, options)
+          contextLine = latest ? latestContextUsageLine(latest) : undefined
+        } catch {
+          // Best effort — deliver without the context footer.
+        }
+        routerLog('turn window closed (next inbound turn recorded); delivering final reply', options.stateDir)
+        return appendContextUsageLine(sanitizedScan, contextLine)
+      }
+    }
+
+    await waitForStable(port, options, options.onHeartbeat, shouldAbortWait)
+
+    // Post-wait JSONL check: if the turn completed during the wait (self-send
+    // detection or next turn opened), deliver immediately without settling —
+    // the worker is in an error loop or already processing the next turn and
+    // won't produce meaningful /messages content for THIS turn (opshub#155).
+    if (jsonlFallbackState) {
+      const postWaitScan = await scanClaudeJsonlTurnReply(jsonlFallbackState)
+      const sanitizedPostWait = postWaitScan.text ? sanitizeAgentReply(postWaitScan.text) : ''
+      if (postWaitScan.turnComplete && sanitizedPostWait) {
+        let contextLine: string | undefined
+        try {
+          const latest = await fetchLatestAgentMessageContent(port, options)
+          contextLine = latest ? latestContextUsageLine(latest) : undefined
+        } catch {
+          /* best effort */
+        }
+        routerLog('turn completed during wait (self-send or next turn); delivering final reply', options.stateDir)
+        return appendContextUsageLine(sanitizedPostWait, contextLine)
+      }
+    }
+
+    const settled = await waitForSettledAgentMessageContent(port, options)
+    let content = settled.content
+    let sanitized = sanitizeAgentReply(content)
+
+    // Post-settle flush race: status can report stable while agentapi /messages is
+    // momentarily empty/context-only, or only a short header plus context footer,
+    // before the final assistant text lands. Rather than immediately returning a
+    // header-only "header\n\nN% context used" (the live opshub#155 signature),
+    // re-poll /messages briefly for the real reply. Startup-artifact screens keep
+    // their JSONL-fallback handling.
+    const needsMessageRepoll = replyNeedsMessageRepoll(sanitized)
+    if (needsMessageRepoll && !replyIsStartupArtifact(sanitized) && !settled.settledWhileRunning) {
+      const recovered = await repollMeaningfulAgentReply(port, options)
+      if (recovered !== undefined) {
+        content = recovered
+        sanitized = sanitizeAgentReply(content)
+      }
+    }
+
+    const contextUsageLine = latestContextUsageLine(content)
+    // A fresh worker's first /messages snapshot can be the Claude startup /
+    // context-index screen rather than a reply to the just-posted message. Treat
+    // it (alongside empty/context-only content) as "no real reply yet" and prefer
+    // the session JSONL, which is keyed to the posted message. Only when we have a
+    // JSONL to fall back to, so a startup false-positive can never drop a reply.
+    const isStartupArtifact = Boolean(jsonlFallbackState) && replyIsStartupArtifact(sanitized)
+    const isHtmlIntermediate = replyLooksLikeHtmlIntermediate(sanitized)
+    const isStaleTuiScrollback = Boolean(jsonlFallbackState) && replyLooksLikeStaleTuiScrollback(content, sanitized, text)
+    // A /messages snapshot that still carries a rendered "← slack ·" inbound echo
+    // is a raw TUI scrollback capture. Those are subject to stale interleaving and
+    // mid-line PTY frame-bleed (the user echo bleeding into the assistant line)
+    // that no line-level sanitizer can repair, so prefer the timing-independent
+    // JSONL reply whenever one exists. Falls through to the sanitized text only if
+    // the JSONL has no reply yet (best effort, unchanged from before) (opshub#155).
+    const isTuiScrollbackShaped = Boolean(jsonlFallbackState) && containsSlackInboundEcho(content)
+    // Settle bailed at the forward-timeout while the worker was still running: the
+    // snapshot is interim (a prior turn's leftover or a mid-tool pause) and must
+    // never be finalized — fall back to JSONL, else context-only/empty (opshub#155).
+    const isInterimWhileRunning = settled.settledWhileRunning
+    if (
+      !replyNeedsJsonlFallback(sanitized) &&
+      !replyLooksHeaderOnlyWithContext(sanitized) &&
+      !isStartupArtifact &&
+      !isHtmlIntermediate &&
+      !isStaleTuiScrollback &&
+      !isTuiScrollbackShaped &&
+      !isInterimWhileRunning
+    ) {
+      return sanitized
+    }
+
+    const jsonlScan = jsonlFallbackState
+      ? await scanClaudeJsonlTurnReply(jsonlFallbackState)
+      : undefined
+    const sanitizedJsonl = jsonlScan?.text ? sanitizeAgentReply(jsonlScan.text) : ''
+    // Diagnostic (no secrets): a truncated delivery surfaces here as a fallback
+    // path firing — e.g. agentapi /messages went empty/context-only or contained
+    // HTML tool-result blocks (opshub#155). Log lengths so a future mismatch is
+    // attributable to this path vs the sanitizer or sendReplyToSlack.
+    const fallbackReason = isInterimWhileRunning ? 'interim-while-running'
+      : isStartupArtifact ? 'startup-artifact'
+      : isHtmlIntermediate ? 'html-intermediate'
+      : isStaleTuiScrollback ? 'stale-tui-scrollback'
+      : isTuiScrollbackShaped ? 'tui-scrollback-shaped'
+      : 'agentapi-empty-or-context-only'
+    const diagnostic = `forwardMessage reply fallback (${fallbackReason}): ` +
+      `raw /messages len=${content.length}, agentapi sanitized len=${sanitized.length}, jsonl len=${sanitizedJsonl.length}`
+    console.error(`[slack] ${diagnostic}`)
+    routerLog(diagnostic, options.stateDir)
+    // Within the overall deadline, a candidate must survive confirmation (the
+    // worker may just be in a false-stable pause). At the deadline, deliver
+    // the transcript's last word as-is — best effort beats nothing.
+    if (sanitizedJsonl && jsonlFallbackState && nowFn() < overallDeadline) {
+      // Window already closed → the candidate is the turn's final reply; the
+      // quiet-window confirm would reject it against the NEXT turn's activity.
+      if (jsonlScan?.turnComplete) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
+      const confirmed = await confirmJsonlCandidate(port, jsonlFallbackState, sanitizedJsonl, options)
+      if (confirmed !== undefined) return appendContextUsageLine(confirmed, contextUsageLine)
+      // Worker resumed — the candidate was mid-turn narration. Re-enter the wait.
+      routerLog('jsonl candidate rejected (worker resumed); re-entering wait', options.stateDir)
+      stableEmptyProbes = 0
+      continue
+    }
+    if (sanitizedJsonl) return appendContextUsageLine(sanitizedJsonl, contextUsageLine)
+
+    // Nothing anywhere yet. Worker still running (or settle bailed mid-run) —
+    // or confirmed stable but the turn may not even have started emitting
+    // (context-window summarization pause). Re-enter the wait.
+    stableEmptyProbes = isInterimWhileRunning ? 0 : stableEmptyProbes + 1
+    if (nowFn() < overallDeadline && stableEmptyProbes < stableEmptyLimit) {
+      await sleep(reprobeDelayMs)
+      continue
+    }
+
+    // Genuinely nothing to deliver after repeated confirmed-stable-empty probes
+    // (or deadline). Never post the raw startup screen, HTML tool-result blocks,
+    // or interim/running content; surface the normalized context-usage line
+    // alone if we have one, else empty (deliverToSession skips empty replies).
+    // A TUI-scrollback-shaped snapshot with no JSONL reply yet is the one case
+    // we still return as-is (best effort) rather than dropping.
+    routerLog(
+      `forwardMessage giving up after ${stableEmptyProbes} stable-empty probes (reason=${fallbackReason})`,
+      options.stateDir,
+    )
+    if (isStartupArtifact || isHtmlIntermediate || isStaleTuiScrollback || isInterimWhileRunning) {
+      return contextUsageLine ?? ''
+    }
+    return sanitized
+  }
+}
+
+// Persistent, size-capped delivery diagnostics. Every silent-loss incident so
+// far (opshub#155) was undiagnosable because the router only wrote to the MCP
+// child's stderr, which nothing captures. Never throws; never blocks delivery.
+const ROUTER_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+export function routerLog(line: string, stateDir?: string): void {
+  const path = join(stateDir || defaultStateDir(), 'router.log')
+  const entry = `${new Date().toISOString()} ${line}\n`
+  void (async () => {
+    try {
+      const st = await stat(path).catch(() => undefined)
+      if (st && st.size > ROUTER_LOG_MAX_BYTES) await rename(path, `${path}.1`)
+      await appendFile(path, entry, { mode: 0o600 })
+    } catch {
+      // logging must never break delivery
+    }
+  })()
+}
+
+
+async function captureClaudeJsonlFallbackState(
+  meta: Record<string, string>,
+  options: ThreadRouterOptions,
+): Promise<ClaudeJsonlFallbackState | undefined> {
+  try {
+    const key = sessionKeyFromMeta(meta)
+    const sessionId = claudeSessionIdForKey(key)
+    const path = claudeProjectSessionJsonlPath(
+      options.cwd || process.cwd(),
+      sessionId,
+      options.claudeProjectsDir,
+    )
+    return { path, lineCount: await countExistingJsonlLines(path), deliveredAtMs: Date.now() }
+  } catch {
+    return undefined
+  }
+}
+
+async function countExistingJsonlLines(path: string): Promise<number> {
+  try {
+    const raw = await readFile(path, 'utf8')
+    if (!raw) return 0
+    return raw.endsWith('\n') ? raw.split('\n').length - 1 : raw.split('\n').length
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return 0
+    throw err
+  }
+}
+
+function replyNeedsJsonlFallback(reply: string): boolean {
+  const trimmed = reply.trim()
+  if (!trimmed) return true
+  return trimmed.split('\n').every((line) => CONTEXT_USAGE_RE.test(line.trim()))
+}
+
+function replyNeedsMessageRepoll(reply: string): boolean {
+  return replyNeedsJsonlFallback(reply) || replyLooksHeaderOnlyWithContext(reply) || replyLooksLikeHtmlIntermediate(reply)
+}
+
+function replyLooksHeaderOnlyWithContext(reply: string): boolean {
+  const trimmed = reply.trim()
+  if (!trimmed) return false
+
+  const lines = trimmed.split('\n').map((line) => line.trim()).filter(Boolean)
+  if (!lines.some((line) => CONTEXT_USAGE_RE.test(line))) return false
+
+  const substantive = lines.filter((line) => !CONTEXT_USAGE_RE.test(line))
+  if (substantive.length !== 1) return false
+
+  const [header] = substantive
+  // Keep this generic: a lone short non-context line followed by a context footer
+  // is likely a prefix/header flush, while a long paragraph + context footer is a
+  // valid concise answer and should not wait or fall back.
+  return header.length <= 120 && trimmed.length <= 180
+}
+
+export function replyIsStartupArtifact(content: string): boolean {
+  return STARTUP_ARTIFACT_RE.test(content)
+}
+
+// Returns true when the sanitized /messages content contains HTML tool-result
+// blocks (<details>/<summary>) outside code fences. These are intermediate TUI
+// artifacts that must trigger JSONL fallback rather than being posted to Slack.
+export function replyLooksLikeHtmlIntermediate(sanitized: string): boolean {
+  if (!sanitized.trim()) return false
+  let inFence = false
+  for (const rawLine of sanitized.replace(/\r\n?/g, '\n').split('\n')) {
+    const trimmedStart = rawLine.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+    if (fence) { inFence = !inFence; continue }
+    if (inFence) continue
+    if (TUI_HTML_TOOL_RESULT_RE.test(rawLine)) return true
+  }
+  return false
+}
+
+function replyLooksLikeStaleTuiScrollback(rawContent: string, sanitized: string, currentTurnText: string): boolean {
+  if (!sanitized.trim()) return false
+  // If stale background-task markers survive scoping into the sanitized reply, it
+  // is stale regardless of whether the current echo is present — the real failure
+  // shape is "current echo + stale old answer redrawn after it" (opshub#155).
+  if (STALE_TUI_SCROLLBACK_RE.test(sanitized)) return true
+  // No markers survived scoping. When the current turn's echo is present the
+  // scoped content is this turn's reply, so any markers in the raw snapshot were
+  // old scrollback above the echo — not stale.
+  if (containsCurrentSlackInboundEcho(rawContent, currentTurnText)) return false
+  // No current echo to anchor freshness and the raw snapshot carries stale
+  // markers → the whole capture is stale scrollback from a prior turn.
+  return STALE_TUI_SCROLLBACK_RE.test(rawContent)
+}
+
+function containsCurrentSlackInboundEcho(content: string, currentTurnText: string): boolean {
+  const current = currentTurnText.replace(/\s+/g, ' ').trim()
+  if (!current) return false
+  const snippet = current.slice(0, Math.min(current.length, 64))
+  for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const normalized = line.replace(TUI_PREFIX_RE, '').replace(/\s+/g, ' ').trim()
+    if (SLACK_INBOUND_ECHO_RE.test(normalized) && normalized.includes(snippet)) return true
+  }
+  return false
+}
+
+// True when the snapshot contains any rendered "← slack ·" inbound echo outside
+// code fences — i.e. it is a raw TUI scrollback capture rather than clean,
+// role-separated agent text. Fenced echoes (a reply quoting one in a code block)
+// are ignored so a legitimate answer is not misclassified (opshub#155).
+function containsSlackInboundEcho(content: string): boolean {
+  let inFence = false
+  let fenceMarker = ''
+  for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmedStart = line.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+    if (inFence) {
+      if (fence && fence[0] === fenceMarker[0] && fence.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+      continue
+    }
+    if (fence) {
+      inFence = true
+      fenceMarker = fence
+      continue
+    }
+    if (SLACK_INBOUND_ECHO_RE.test(line.replace(TUI_PREFIX_RE, '').trim())) return true
+  }
+  return false
+}
+
+function latestContextUsageLine(content: string): string | undefined {
+  let latest: string | undefined
+  CONTEXT_USAGE_ANYWHERE_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = CONTEXT_USAGE_ANYWHERE_RE.exec(content)) !== null) {
+    latest = `${match[1]} context used`
+  }
+  return latest
+}
+
+function appendContextUsageLine(reply: string, contextUsageLine: string | undefined): string {
+  const trimmed = reply.trim()
+  if (!contextUsageLine || !trimmed) return trimmed
+  if (trimmed.split('\n').some((line) => line.trim() === contextUsageLine)) return trimmed
+  return `${trimmed}\n\n${contextUsageLine}`
+}
+
+export interface HeartbeatInfo {
+  // Raw current visible Claude Code TUI status line, if any (e.g. "✶ Ruminating…").
+  status?: string
+  // Raw or normalized context-usage text; the parseable figure is extracted.
+  contextUsage?: string
+}
+
+// Text for the in-place progress heartbeat the main router shows while a thread
+// worker is busy. Prefers the live TUI status verb (e.g. "Ruminating…"); falls
+// back to a neutral terminal-style "Working…". Never emits "Thinking" and never
+// echoes raw TUI content (no spam). Appends a normalized "N% context used" tail
+// when a figure is parseable.
+export function buildHeartbeatMessage(info: HeartbeatInfo = {}): string {
+  const phrase = heartbeatStatusPhrase(info.status) ?? 'Working…'
+  const match = info.contextUsage?.match(/(\d+%)\s+context used/i)
+  return match ? `${phrase} · ${match[1]} context used` : phrase
+}
+
+// Placeholder text shown while a new turn waits in the per-thread delivery queue
+// because the worker is busy with a prior message. Distinct from the active-work
+// heartbeat ("Working…") so the user can tell their message is queued, not yet
+// being processed, and is not a failure (opshub#155).
+export function buildQueuedMessage(info: HeartbeatInfo = {}): string {
+  const base = '⏳ Queued — the worker is busy with a previous message…'
+  const match = info.contextUsage?.match(/(\d+%)\s+context used/i)
+  return match ? `${base} · ${match[1]} context used` : base
+}
+
+function heartbeatStatusPhrase(status: string | undefined): string | undefined {
+  if (!status) return undefined
+  const verb = status.match(HEARTBEAT_STATUS_VERB_RE)?.[1]?.trim()
+  if (!verb || /^thinking$/i.test(verb)) return undefined
+  return `${verb}…`
+}
+
+// Returns true when the error is the transient "agent is not waiting for user
+// input" agentapi 500, indicating the worker is busy with a prior turn and the
+// new turn should be queued rather than dropped (opshub#155).
+export function isNotWaitingForUserInputError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return AGENT_WAITING_FOR_USER_INPUT_RE.test(msg)
+}
+
+// Drains a per-thread delivery queue: attempts each turn in FIFO order,
+// retrying transient failures (worker busy) up to drainTimeoutMs. Fatal errors
+// are dequeued and caller-notified; the remaining turns continue. When the
+// drain window expires, all still-queued turns are passed to onFailRemaining.
+// All I/O is via callbacks so the loop is pure/testable (opshub#155).
+export async function runDeliveryDrainLoop(options: {
+  getQueue: () => QueuedTurn[]
+  setQueue: (q: QueuedTurn[]) => void
+  attemptTurn: (turn: QueuedTurn) => Promise<'ok' | 'transient' | 'fatal'>
+  onFailRemaining: (turns: QueuedTurn[]) => Promise<void>
+  pollMs?: number
+  ttlMs?: number
+  drainTimeoutMs?: number
+  sleep?: (ms: number) => Promise<void>
+  now?: () => number
+}): Promise<void> {
+  const {
+    getQueue, setQueue, attemptTurn, onFailRemaining,
+  } = options
+  const pollMs = options.pollMs ?? DEFAULT_QUEUE_DRAIN_POLL_MS
+  const ttlMs = options.ttlMs ?? DEFAULT_QUEUE_TTL_MS
+  const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_QUEUE_DRAIN_TIMEOUT_MS
+  const sleepFn = options.sleep ?? sleep
+  const now = options.now ?? Date.now
+
+  const deadline = now() + drainTimeoutMs
+
+  while (now() < deadline) {
+    // Prune expired turns before each attempt.
+    const live = getQueue().filter((t) => now() - t.enqueuedAt < ttlMs)
+    setQueue(live)
+    if (live.length === 0) return
+
+    const turn = live[0]!
+    const result = await attemptTurn(turn)
+
+    if (result === 'transient') {
+      // Worker still busy — back off and retry.
+      await sleepFn(Math.min(pollMs, Math.max(1, deadline - now())))
+      continue
+    }
+
+    // ok or fatal: remove from queue and drain next turn immediately.
+    const remaining = getQueue().slice(1)
+    setQueue(remaining)
+    if (remaining.length === 0) return
+  }
+
+  // Drain window exceeded — fail any still-queued turns.
+  // Snapshot before clearing so setQueue([]) doesn't mutate what we pass out.
+  const remaining = getQueue().slice()
+  setQueue([])
+  if (remaining.length > 0) await onFailRemaining(remaining)
+}
+
+// Scans the session JSONL for the forwarded turn's reply. `text` is the last
+// assistant text inside the turn's window; `turnComplete` reports whether that
+// text is the turn's final reply (deliverable without a worker-quiet confirm).
+// Complete when any of:
+//   1. a later real inbound turn was recorded (claude-code only writes it once
+//      it starts consuming the next turn — opshub#155 livelock, 2026-07-06)
+//   2. the worker self-sent via `claude mcp call` (opshub#155, 2026-07-08)
+//   3. the latest deliverable assistant record has stop_reason `end_turn`
+//      (live 2026-07-17: agentapi stayed `running`/spinner-visible after the
+//      model finished, so candidate-confirm kept rejecting until the next
+//      user message flushed the prior reply)
+async function scanClaudeJsonlTurnReply(
+  state: ClaudeJsonlFallbackState,
+): Promise<{ text: string | undefined; turnComplete: boolean }> {
+  let raw: string
+  try {
+    raw = await readFile(state.path, 'utf8')
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
+      return { text: undefined, turnComplete: false }
+    }
+    throw err
+  }
+
+  const lines = raw.split('\n').filter((line) => line.trim())
+  let sawPostedUser = false
+  let latestText: string | undefined
+  let turnComplete = false
+
+  for (const line of lines.slice(state.lineCount)) {
+    let entry: unknown
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!entry || typeof entry !== 'object') continue
+    const record = entry as Record<string, unknown>
+
+    if (record['type'] === 'user' && record['isMeta'] !== true) {
+      // Tool results are also type 'user' but carry array content; only a real
+      // inbound turn (string content) opens — or closes — the scan window.
+      const message = record['message']
+      const isRealUserTurn = Boolean(message && typeof message === 'object' &&
+        typeof (message as Record<string, unknown>)['content'] === 'string')
+      if (isRealUserTurn) {
+        // A second inbound turn means our turn's window ended; never pick up
+        // the NEXT turn's reply into this one (queued-turn correctness).
+        if (sawPostedUser) {
+          turnComplete = true
+          break
+        }
+        sawPostedUser = true
+      }
+      continue
+    }
+    if (record['type'] !== 'assistant') continue
+    if (!sawPostedUser) {
+      // No user record seen in the window (post-summarization transcripts can
+      // reshape it): accept assistant records provably written after delivery.
+      const ts = typeof record['timestamp'] === 'string' ? Date.parse(record['timestamp']) : NaN
+      if (!Number.isFinite(ts) || state.deliveredAtMs === undefined || ts < state.deliveredAtMs) continue
+    }
+
+    const assistantText = extractClaudeAssistantText(record)
+    if (assistantText && !isIgnoredClaudeAssistantText(assistantText)) latestText = assistantText
+    // Self-send detection: a tool_use(Bash: "claude mcp call/batchCalls") means
+    // the worker tried to deliver the reply itself.  The text portion of THIS
+    // record is the real answer; everything after is error-loop noise.  Mark the
+    // turn complete so the router delivers immediately (opshub#155, 2026-07-08).
+    if (containsSlackSelfSendToolUse(record)) {
+      turnComplete = true
+      break
+    }
+    // Model-finished signal: stop_reason end_turn is written when the assistant
+    // message is done. Require THIS record's deliverable text — not merely any
+    // earlier latestText. Live 2026-07-17: a thinking-only end_turn sibling
+    // arrived while latestText still held mid-turn tool_use narration
+    // ("先看一眼…"); completing on latestText finalized the narration and
+    // skipped the real final text record that followed. stop_reason tool_use
+    // stays incomplete (more work follows).
+    if (
+      assistantStopReason(record) === 'end_turn' &&
+      assistantText &&
+      !isIgnoredClaudeAssistantText(assistantText)
+    ) {
+      turnComplete = true
+      break
+    }
+  }
+
+  return { text: latestText, turnComplete }
+}
+
+function assistantStopReason(record: Record<string, unknown>): string | undefined {
+  const message = record['message']
+  if (!message || typeof message !== 'object') return undefined
+  const stopReason = (message as Record<string, unknown>)['stop_reason']
+  return typeof stopReason === 'string' ? stopReason : undefined
+}
+
+function extractClaudeAssistantText(record: Record<string, unknown>): string {
+  const message = record['message']
+  if (!message || typeof message !== 'object') return ''
+  const messageRecord = message as Record<string, unknown>
+  if (messageRecord['model'] === '<synthetic>') return ''
+  const content = messageRecord['content']
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+
+  return content
+    .map((part) => {
+      if (!part || typeof part !== 'object') return ''
+      const partRecord = part as Record<string, unknown>
+      return partRecord['type'] === 'text' && typeof partRecord['text'] === 'string'
+        ? partRecord['text']
+        : ''
+    })
+    .filter((part) => part.trim())
+    .join('\n')
+}
+
+function isIgnoredClaudeAssistantText(text: string): boolean {
+  return /^no response requested\.?$/i.test(text.trim())
+}
+
+export function containsSlackSelfSendToolUse(record: Record<string, unknown>): boolean {
+  const message = record['message']
+  if (!message || typeof message !== 'object') return false
+  const content = (message as Record<string, unknown>)['content']
+  if (!Array.isArray(content)) return false
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue
+    const p = part as Record<string, unknown>
+    if (p['type'] !== 'tool_use') continue
+    const input = p['input']
+    if (!input || typeof input !== 'object') continue
+    const command = (input as Record<string, unknown>)['command']
+    if (typeof command === 'string' && SLACK_SELF_SEND_RE.test(command)) return true
+  }
+  return false
+}
+
+// Progressive finalize (opshub#155, 2026-07-06): a JSONL-fallback candidate is
+// only trusted after the worker stays visibly idle AND the candidate stays the
+// transcript's last word for candidateConfirmMs. Returns the (possibly newer)
+// confirmed text, or undefined when the worker resumed — the caller re-enters
+// the wait loop and picks up the real final reply later.
+async function confirmJsonlCandidate(
+  port: number,
+  state: ClaudeJsonlFallbackState,
+  initial: string,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  const confirmMs = options.candidateConfirmMs ?? DEFAULT_CANDIDATE_CONFIRM_MS
+  if (confirmMs <= 0) return initial
+  const pollMs = Math.max(1, Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, 2_000))
+  let candidate = initial
+  let quietSince = Date.now()
+
+  while (true) {
+    await sleep(Math.min(pollMs, Math.max(1, quietSince + confirmMs - Date.now())))
+    // Turn-window check first: a later real inbound turn in the JSONL proves
+    // the candidate's turn finished. Worker 'running'/spinner state then
+    // belongs to the NEXT queued turn and must not reject the finished reply
+    // (opshub#155 livelock, 2026-07-06).
+    const scan = await scanClaudeJsonlTurnReply(state)
+    if (scan.turnComplete) {
+      const sanitizedFinal = scan.text ? sanitizeAgentReply(scan.text) : ''
+      return sanitizedFinal || candidate
+    }
+    try {
+      if ((await getAgentStatus(port, options)) === 'running') return undefined
+    } catch {
+      return candidate // status endpoint gone (worker restart?) — best effort
+    }
+    try {
+      // /status can report stable during quiet tool calls; a live TUI spinner
+      // line ("✶ Baking… (12s · esc to interrupt)") is the tell that the turn
+      // is still in flight.
+      const content = await fetchLatestAgentMessageContent(port, options)
+      if (content && latestStatusLine(content) !== undefined) return undefined
+    } catch {
+      // /messages hiccup: fall through to the transcript check
+    }
+    const sanitizedLatest = scan.text ? sanitizeAgentReply(scan.text) : ''
+    if (sanitizedLatest && sanitizedLatest !== candidate) {
+      candidate = sanitizedLatest // newer text wins; restart the quiet window
+      quietSince = Date.now()
+      continue
+    }
+    if (Date.now() - quietSince >= confirmMs) return candidate
+  }
+}
+
+async function waitForSettledAgentMessageContent(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<{ content: string; settledWhileRunning: boolean }> {
+  const settleMs = Math.max(0, options.messageSettleMs ?? DEFAULT_MESSAGE_SETTLE_MS)
+  const pollMs = Math.max(
+    1,
+    Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, DEFAULT_MESSAGE_SETTLE_POLL_MS),
+  )
+  // Overall ceiling so a worker that resumes and never settles can't wedge the
+  // forward; reuses waitForStable's bound (opshub#155, Phase 5 follow-up).
+  const overallDeadline = Date.now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
+  let settleDeadline = Date.now() + settleMs
+  let previousContent: string | undefined
+  let latestContent: string | undefined
+  let hasPrevious = false
+
+  while (true) {
+    latestContent = await fetchLatestAgentMessageContent(port, options)
+    // A worker that is still running can post mid-turn content during tool-call
+    // pauses; unchanged content must not settle while it is busy, or the reply
+    // gets truncated. Only count the settle window once status is stable.
+    const running = (await getAgentStatus(port, options)) === 'running'
+
+    if (running) {
+      // Provisional mid-turn content: drop the unchanged-content tracking and
+      // restart the settle window so a pause cannot post a partial reply.
+      previousContent = undefined
+      hasPrevious = false
+      settleDeadline = Date.now() + settleMs
+    } else if (
+      latestContent !== undefined &&
+      hasPrevious &&
+      latestContent === previousContent
+    ) {
+      return { content: latestContent, settledWhileRunning: false }
+    } else {
+      previousContent = latestContent
+      hasPrevious = true
+    }
+
+    const now = Date.now()
+    // Overall ceiling hit. If the worker is still running, the snapshot is interim
+    // (a prior turn's leftover or a mid-tool pause); flag it so the caller falls
+    // back rather than finalizing interim content (opshub#155).
+    if (now >= overallDeadline) return { content: latestContent || '', settledWhileRunning: running }
+    if (!running && (settleMs === 0 || now >= settleDeadline)) {
+      return { content: latestContent || '', settledWhileRunning: false }
+    }
+    const cap = running ? overallDeadline : settleDeadline
+    await sleep(Math.min(pollMs, Math.max(1, cap - now)))
+  }
+}
+
+async function fetchLatestAgentMessageContent(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  const fetchImpl = options.fetch || fetch
+  const body = await fetchJson<MessagesBody>(fetchImpl, `http://127.0.0.1:${port}/messages`)
+  const agentMessages = (body.messages || []).filter(
+    (message) => message.role === 'agent' && typeof message.content === 'string',
+  )
+  return agentMessages.at(-1)?.content
+}
+
+// After the agent is stable but /messages settled empty/context-only, re-poll
+// briefly for a real reply (a flush race). Returns the raw /messages content once
+// it sanitizes to a real reply (non-fallback, non-startup-artifact), or undefined
+// if the budget expires — in which case the caller keeps its existing JSONL /
+// context-only fallback (opshub#155, Phase 5 follow-up).
+async function repollMeaningfulAgentReply(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<string | undefined> {
+  const budgetMs = Math.max(0, options.replyRepollMs ?? DEFAULT_REPLY_REPOLL_MS)
+  if (budgetMs === 0) return undefined
+  const pollMs = Math.max(
+    1,
+    Math.min(options.statusPollMs || DEFAULT_STATUS_POLL_MS, DEFAULT_MESSAGE_SETTLE_POLL_MS),
+  )
+  const now = options.now || Date.now
+  const deadline = now() + budgetMs
+
+  while (now() < deadline) {
+    await sleep(Math.min(pollMs, Math.max(1, deadline - now())))
+    const content = await fetchLatestAgentMessageContent(port, options)
+    if (content === undefined) continue
+    const sanitized = sanitizeAgentReply(content)
+    if (!replyNeedsMessageRepoll(sanitized) && !replyIsStartupArtifact(sanitized)) {
+      return content
+    }
+  }
+  return undefined
+}
+
+export function sanitizeAgentReply(content: string): string {
+  content = scopeToLatestSlackInboundEcho(content)
+  content = stripLeakedPromptContext(content)
+
+  const sanitizedLines: string[] = []
+  let inFence = false
+  let fenceMarker = ''
+  let skippingSlackEchoContinuation = false
+
+  for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmedStart = line.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+
+    if (inFence) {
+      sanitizedLines.push(line)
+      if (fence && fence[0] === fenceMarker[0] && fence.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+      continue
+    }
+
+    if (fence) {
+      sanitizedLines.push(line)
+      inFence = true
+      fenceMarker = fence
+      continue
+    }
+
+    const withoutTuiPrefix = line.replace(TUI_PREFIX_RE, '')
+    const trimmed = withoutTuiPrefix.trim()
+    if (skippingSlackEchoContinuation) {
+      if (!trimmed) {
+        skippingSlackEchoContinuation = false
+        sanitizedLines.push('')
+        continue
+      }
+
+      if (SLACK_ECHO_CONTINUATION_RE.test(trimmed)) {
+        continue
+      }
+
+      skippingSlackEchoContinuation = false
+    }
+
+    if (
+      trimmed &&
+      (TUI_TIMED_STATUS_RE.test(trimmed) ||
+        TUI_TOOL_STATUS_RE.test(trimmed) ||
+        TUI_TRANSIENT_STATUS_RE.test(trimmed))
+    ) {
+      continue
+    }
+
+    if (trimmed && SLACK_INBOUND_ECHO_RE.test(trimmed)) {
+      skippingSlackEchoContinuation = true
+      continue
+    }
+
+    const contextUsage = trimmed.match(CONTEXT_USAGE_RE)
+    if (contextUsage) {
+      sanitizedLines.push(`${contextUsage[1]} context used`)
+      continue
+    }
+
+    sanitizedLines.push(normalizeReplyLine(withoutTuiPrefix))
+  }
+
+  return sanitizedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function stripLeakedPromptContext(content: string): string {
+  let stripped = content.replace(/\r\n?/g, '\n')
+
+  // Claude can occasionally echo the thread-router prompt envelope before the
+  // real answer. Never post those internal XML-ish wrappers or recalled-memory
+  // payloads back into Slack. Keep this before line-level TUI cleanup so the
+  // final answer and context-usage footer can still be normalized below.
+  stripped = stripped
+    .replace(/<slack_context\b[\s\S]*?<\/slack_context>\s*/gi, '')
+    .replace(/&lt;slack_context\b[\s\S]*?&lt;\/slack_context&gt;\s*/gi, '')
+    .replace(/^.*\bYou are replying in this Slack thread\.[\s\S]*?<\/slack_context>\s*/gim, '')
+    .replace(/^.*\bYou are replying in this Slack thread\.[\s\S]*?&lt;\/slack_context&gt;\s*/gim, '')
+    .replace(/<channel\b[^>]*source=["']slack["'][\s\S]*?<\/channel>\s*/gi, '')
+    .replace(/&lt;channel\b[^\n]*source=["']slack["'][\s\S]*?&lt;\/channel&gt;\s*/gi, '')
+    .replace(/<memory-context>[\s\S]*?<\/memory-context>\s*/gi, '')
+    .replace(/&lt;memory-context&gt;[\s\S]*?&lt;\/memory-context&gt;\s*/gi, '')
+    .replace(/^(?:[^\n]*(?:\bts=|\buser=|\buser_id=|\bmessage_id=|\battachment_count=)[^\n]*\n){1,6}/i, '')
+
+  return stripped
+}
+
+function scopeToLatestSlackInboundEcho(content: string): string {
+  const lines = content.replace(/\r\n?/g, '\n').split('\n')
+  let latestEchoIndex = -1
+  let inFence = false
+  let fenceMarker = ''
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmedStart = line.trimStart()
+    const fence = trimmedStart.match(/^(```+|~~~+)/)?.[1]
+
+    if (inFence) {
+      if (fence && fence[0] === fenceMarker[0] && fence.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+      continue
+    }
+
+    if (fence) {
+      inFence = true
+      fenceMarker = fence
+      continue
+    }
+
+    if (SLACK_INBOUND_ECHO_RE.test(line.replace(TUI_PREFIX_RE, '').trim())) {
+      latestEchoIndex = index
+    }
+  }
+
+  if (latestEchoIndex < 0) return content
+
+  const afterEcho = latestEchoIndex + 1
+  const blankAfterEchoIndex = lines.findIndex((rawLine, index) => {
+    if (index < afterEcho) return false
+    const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    return !line.replace(TUI_PREFIX_RE, '').trim()
+  })
+
+  if (blankAfterEchoIndex > afterEcho && blankAfterEchoIndex - afterEcho >= 2) {
+    const beforeBlankLooksLikeEchoContinuation = lines.slice(afterEcho, blankAfterEchoIndex).every((rawLine) => {
+      const line = rawLine.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+      const trimmed = line.replace(TUI_PREFIX_RE, '').trim()
+      return Boolean(trimmed) && !TUI_PREFIX_RE.test(line) && !CONTEXT_USAGE_RE.test(trimmed)
+    })
+    if (beforeBlankLooksLikeEchoContinuation) {
+      return lines.slice(blankAfterEchoIndex + 1).join('\n')
+    }
+  }
+
+  let start = afterEcho
+  while (start < lines.length) {
+    const line = lines[start]!.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trimEnd()
+    const trimmed = line.replace(TUI_PREFIX_RE, '').trim()
+    if (!trimmed) {
+      start += 1
+      break
+    }
+    if (!SLACK_ECHO_CONTINUATION_RE.test(trimmed)) break
+    start += 1
+  }
+
+  return lines.slice(start).join('\n')
+}
+
+function normalizeReplyLine(line: string): string {
+  if (!line.trim()) return ''
+
+  const markdownPrefix = line.match(MARKDOWN_LINE_PREFIX_RE)?.[1]
+  if (markdownPrefix) {
+    return markdownPrefix + line.slice(markdownPrefix.length).replace(EXCESS_HORIZONTAL_SPACE_RE, ' ')
+  }
+
+  if (/^(?: {4,}|\t)/.test(line)) {
+    return line
+  }
+
+  return line.trimStart().replace(EXCESS_HORIZONTAL_SPACE_RE, ' ')
+}
+
+function escapeAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+export function formatForwardedMessage(
+  text: string,
+  meta: Record<string, string>,
+  options: { includeSlackContext?: boolean } = {},
+): string {
+  const attrs = Object.entries(meta)
+    .filter(([, value]) => value !== '')
+    .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
+    .join(' ')
+  const channel = `<channel source="slack" ${attrs}>\n${text}\n</channel>`
+  if (options.includeSlackContext === false) return channel
+  return `${buildSlackContextPrompt(meta)}\n\n${channel}`
+}
+
+export function buildSlackContextPrompt(meta: Record<string, string>): string {
+  const attrs: Record<string, string> = {
+    channel_id: meta['chat_id'] || '',
+    thread_ts: meta['thread_ts'] || meta['ts'] || '',
+    ts: meta['ts'] || '',
+    user: meta['user'] || '',
+    user_id: meta['user_id'] || '',
+    message_id: meta['message_id'] || meta['ts'] || '',
+    attachment_count: meta['attachment_count'] || '0',
+  }
+  if (meta['attachment_paths']) {
+    attrs.attachment_paths = meta['attachment_paths']
+  }
+
+  const renderedAttrs = Object.entries(attrs)
+    .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
+    .join(' ')
+
+  return [
+    `<slack_context ${renderedAttrs}>`,
+    'You are replying in this Slack thread. Answer concisely for Slack.',
+    'Your text output IS the Slack reply — the thread router forwards it automatically. Do NOT attempt to send messages yourself via claude mcp, Bash curl/API calls, or any CLI command.',
+    'If attachment_paths is present, inspect those local files with Read/Bash as needed before answering.',
+    'If context, history, search results, or attachments are missing, say what to fetch instead of assuming.',
+    '</slack_context>',
+  ].join('\n')
+}
+
+export async function claimSlackContextForSession(
+  channel: string,
+  threadTs: string,
+  options: ThreadRouterOptions = {},
+): Promise<boolean> {
+  const stateDir = options.stateDir || defaultStateDir()
+  const key = buildSessionKey(channel, threadTs)
+
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const session = registry[key]
+    if (!session) return true
+    if (session.slack_context_sent_at) return false
+
+    registry[key] = {
+      ...session,
+      slack_context_sent_at: new Date((options.now || Date.now)()).toISOString(),
+    }
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    return true
+  })
+}
+
+export async function cleanupIdle(
+  ttlMs: number,
+  options: ThreadRouterOptions = {},
+): Promise<string[]> {
+  const stateDir = options.stateDir || defaultStateDir()
+  const now = options.now || Date.now
+  const killProcess = options.killProcess || defaultKillProcess
+
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const staleKeys: string[] = []
+    const cutoff = now() - ttlMs
+
+    for (const [key, session] of Object.entries(registry)) {
+      if (session.status !== 'active' && session.status !== 'activating') continue
+      const lastActive = Date.parse(session.last_active_at)
+      if (!Number.isFinite(lastActive) || lastActive > cutoff) continue
+
+      if (session.pid > 0) {
+        await killProcess(session.pid)
+      }
+      registry[key] = {
+        ...session,
+        pid: 0,
+        status: 'archived',
+        last_active_at: new Date(now()).toISOString(),
+      }
+      staleKeys.push(key)
+    }
+
+    if (staleKeys.length) {
+      await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    }
+    return staleKeys
+  })
+}
+
+export async function reapFakeActiveSessions(
+  options: ThreadRouterOptions = {},
+): Promise<string[]> {
+  const stateDir = options.stateDir || defaultStateDir()
+  const now = options.now || Date.now
+
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const reaped: string[] = []
+
+    for (const [key, session] of Object.entries(registry)) {
+      if (session.status !== 'active' && session.status !== 'activating') continue
+      if (!(await isFakeActiveSession(session, options))) continue
+      registry[key] = {
+        ...session,
+        pid: 0,
+        status: 'dead',
+        last_active_at: new Date(now()).toISOString(),
+      }
+      reaped.push(key)
+    }
+
+    if (reaped.length) {
+      await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    }
+    return reaped
+  })
+}
+
+// A session is fake-active when its registry status claims active/activating
+// but the worker is gone: a recorded pid that is no longer alive, or — for an
+// already-active session — a port nothing is listening on (a free/bindable port
+// means the agentapi released it). Activating sessions skip the port probe:
+// their agentapi may not have bound the port yet.
+async function isFakeActiveSession(
+  session: ThreadSession,
+  options: ThreadRouterOptions,
+): Promise<boolean> {
+  if (session.pid > 0 && !isPidAlive(session.pid, options)) return true
+  if (session.status === 'active') {
+    const portIsAvailable = options.portIsAvailable || defaultPortIsAvailable
+    if (await portIsAvailable(session.port)) return true
+  }
+  return false
+}
+
+async function ensureSessionUnshared(
+  key: string,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<ThreadSession> {
+  await reapFakeActiveSessions({ ...options, stateDir })
+  const existing = await readRegistry(stateDir).then((registry) => registry[key])
+  if (existing?.status === 'active') {
+    if (await isThreadSessionHealthy(key, existing, options, stateDir)) {
+      return touchSession(key, existing, options, stateDir)
+    }
+    await markDeadIfCurrent(key, existing, options, stateDir)
+  }
+  if (existing?.status === 'activating') {
+    return waitForActivation(key, options, stateDir)
+  }
+
+  return activateSession(key, options, stateDir)
+}
+
+async function activateSession(
+  key: string,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<ThreadSession> {
+  const claim = await claimActivation(key, options, stateDir)
+  if (claim.status === 'active') {
+    if (await isThreadSessionHealthy(key, claim, options, stateDir)) {
+      return touchSession(key, claim, options, stateDir)
+    }
+    await markDeadIfCurrent(key, claim, options, stateDir)
+    return activateSession(key, options, stateDir)
+  }
+  if (claim.status !== 'activating') {
+    return waitForActivation(key, options, stateDir)
+  }
+
+  const primaryModel = threadClaudeModel()
+  const fallbackModel = threadClaudeFallbackModel()
+  const models = fallbackModel && fallbackModel !== primaryModel
+    ? [primaryModel, fallbackModel]
+    : [primaryModel]
+
+  let lastErr: unknown
+  for (const [index, model] of models.entries()) {
+    try {
+      const pid = await spawnThreadAgent(claim.port, key, stateDir, options, model)
+      return markActive(key, claim, pid, options, stateDir)
+    } catch (err) {
+      lastErr = err
+      const canFallback = index === 0 && models.length > 1 && await hasUnknownProviderStartupStateFile(stateDir, key)
+      if (!canFallback) {
+        await markDeadIfCurrent(key, claim, options, stateDir)
+        throw err
+      }
+      console.error(`[slack] thread worker model ${model} unavailable; retrying with ${models[1]}`)
+      await unlinkFatalStartupStateFile(stateDir, key)
+    }
+  }
+
+  await markDeadIfCurrent(key, claim, options, stateDir)
+  throw lastErr instanceof Error ? lastErr : new Error('Failed to activate thread session')
+}
+
+async function spawnThreadAgent(
+  port: number,
+  key: string,
+  stateDir: string,
+  options: ThreadRouterOptions,
+  model: string,
+): Promise<number> {
+  const cwd = options.cwd || process.cwd()
+  const agentapiPath = options.agentapiPath || join(homedir(), 'bin', 'agentapi')
+  const { command, args } = buildAgentapiCommand(port, key, stateDir, agentapiPath, { cwd, model })
+  const spawnAgent = options.spawnAgent || defaultSpawnAgent
+
+  await mkdir(join(stateDir, 'sessions'), { recursive: true, mode: 0o700 })
+  await unlinkFatalStartupStateFile(stateDir, key)
+  const child = spawnAgent(command, args, {
+    cwd,
+    detached: true,
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '0.80',
+    },
+  })
+  child.unref?.()
+  await waitForAgentHealthy(port, options, key, stateDir)
+  return child.pid || 0
+}
+
+async function claimActivation(
+  key: string,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<ThreadSession> {
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const current = registry[key]
+    if (current?.status === 'active' || current?.status === 'activating') {
+      return current
+    }
+
+    const nowIso = new Date((options.now || Date.now)()).toISOString()
+    const port = await nextFreePort(registry, options)
+    const session: ThreadSession = {
+      session_id: claudeSessionIdForKey(key),
+      port,
+      pid: 0,
+      status: 'activating',
+      created_at: current?.created_at || nowIso,
+      last_active_at: nowIso,
+      cwd: options.cwd || process.cwd(),
+    }
+    registry[key] = session
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    return session
+  })
+}
+
+async function touchSession(
+  key: string,
+  session: ThreadSession,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<ThreadSession> {
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const current = registry[key]
+    if (!current || current.port !== session.port) return session
+    const touched: ThreadSession = {
+      ...current,
+      last_active_at: new Date((options.now || Date.now)()).toISOString(),
+    }
+    registry[key] = touched
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    return touched
+  })
+}
+
+async function markActive(
+  key: string,
+  session: ThreadSession,
+  pid: number,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<ThreadSession> {
+  return withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const current = registry[key]
+    if (!current || current.port !== session.port || current.status !== 'activating') {
+      return current || session
+    }
+    const active: ThreadSession = {
+      ...current,
+      pid,
+      status: 'active',
+      last_active_at: new Date((options.now || Date.now)()).toISOString(),
+    }
+    registry[key] = active
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+    return active
+  })
+}
+
+async function markDeadIfCurrent(
+  key: string,
+  session: ThreadSession,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<void> {
+  await withRegistryLock(stateDir, async () => {
+    const registry = await readRegistryFile(registryFilePath(stateDir))
+    const current = registry[key]
+    if (!current || current.port !== session.port) return
+    registry[key] = {
+      ...current,
+      pid: 0,
+      status: 'dead',
+      last_active_at: new Date((options.now || Date.now)()).toISOString(),
+    }
+    await writeRegistryAtomic(registryFilePath(stateDir), registry)
+  })
+}
+
+async function waitForActivation(
+  key: string,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<ThreadSession> {
+  const deadline = Date.now() + (options.activationTimeoutMs || DEFAULT_ACTIVATION_TIMEOUT_MS)
+  const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
+
+  while (Date.now() <= deadline) {
+    const session = await readRegistry(stateDir).then((registry) => registry[key])
+    if (!session || session.status === 'dead' || session.status === 'archived') {
+      return activateSession(key, options, stateDir)
+    }
+    if (session.status === 'active') {
+      if (await isThreadSessionHealthy(key, session, options, stateDir)) {
+        return touchSession(key, session, options, stateDir)
+      }
+      await markDeadIfCurrent(key, session, options, stateDir)
+      return activateSession(key, options, stateDir)
+    }
+    await sleep(pollMs)
+  }
+
+  throw new Error(`Timed out waiting for thread session activation: ${key}`)
+}
+
+async function waitForAgentHealthy(
+  port: number,
+  options: ThreadRouterOptions,
+  key?: string,
+  stateDir?: string,
+): Promise<void> {
+  const deadline = Date.now() + (options.activationTimeoutMs || DEFAULT_ACTIVATION_TIMEOUT_MS)
+  const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
+
+  while (Date.now() <= deadline) {
+    if (key && stateDir && await hasFatalStartupStateFile(stateDir, key)) {
+      throw new Error(`Fatal Claude startup state for thread session: ${key}`)
+    }
+    if (await isAgentHealthy(port, options)) return
+    await sleep(pollMs)
+  }
+
+  throw new Error(`Timed out waiting for agentapi on port ${port}`)
+}
+
+async function waitForStable(
+  port: number,
+  options: ThreadRouterOptions,
+  onHeartbeat?: (info: HeartbeatInfo) => void | Promise<void>,
+  shouldAbort?: () => Promise<boolean>,
+): Promise<void> {
+  const now = options.now || Date.now
+  const deadline = now() + (options.forwardTimeoutMs || DEFAULT_FORWARD_TIMEOUT_MS)
+  const pollMs = options.statusPollMs || DEFAULT_STATUS_POLL_MS
+  const heartbeatMs = Math.max(0, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
+  const confirmPolls = Math.max(0, options.stableConfirmPolls ?? DEFAULT_STABLE_CONFIRM_POLLS)
+  let nextHeartbeatAt = 0
+  let sawStable = false
+
+  while (now() <= deadline) {
+    // Early exit when the JSONL scan shows the turn completed (e.g. self-send
+    // tool-call detected) — the real answer is already available and the worker
+    // is stuck in an error loop that will never settle (opshub#155, 2026-07-08).
+    if (shouldAbort && await shouldAbort()) return
+    const status = await getAgentStatus(port, options)
+    if (status === 'stable') {
+      sawStable = true
+      // Compaction guard: context compaction can cause a brief false "stable"
+      // before the agent resumes processing in a new context window.  Require
+      // N consecutive stable polls so a compaction transition (stable → running
+      // → stable) re-enters the wait loop instead of returning stale content.
+      let confirmed = true
+      for (let i = 0; i < confirmPolls && now() <= deadline; i++) {
+        await sleep(pollMs)
+        const recheck = await getAgentStatus(port, options)
+        if (recheck !== 'stable') {
+          confirmed = false
+          break
+        }
+      }
+      if (confirmed) return
+      // Agent went back to running (context compaction) — continue waiting.
+      continue
+    }
+    // status === 'running': emit a rate-limited progress heartbeat. The first
+    // running poll fires immediately (liveness); later ones are throttled to
+    // heartbeatMs. Best-effort context usage; failures never break the wait.
+    if (onHeartbeat) {
+      const at = now()
+      if (at >= nextHeartbeatAt) {
+        nextHeartbeatAt = at + heartbeatMs
+        const info = await currentHeartbeatInfo(port, options)
+        void Promise.resolve(onHeartbeat(info)).catch(() => {})
+      }
+    }
+    await sleep(pollMs)
+  }
+
+  // If the agent was seen stable at least once but confirmation could not
+  // complete (it stayed running after the transient stable), fall through to
+  // the settle loop which will handle the running state with its own
+  // settledWhileRunning / JSONL-fallback logic.
+  if (sawStable) return
+
+  throw new Error(`Timed out waiting for agentapi to become stable on port ${port}`)
+}
+
+async function currentHeartbeatInfo(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<HeartbeatInfo> {
+  try {
+    const content = await fetchLatestAgentMessageContent(port, options)
+    if (!content) return {}
+    return { status: latestStatusLine(content), contextUsage: latestContextUsageLine(content) }
+  } catch {
+    return {}
+  }
+}
+
+function latestStatusLine(content: string): string | undefined {
+  let latest: string | undefined
+  for (const raw of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '').trim()
+    if (TUI_STATUS_GLYPH_RE.test(line)) latest = line
+  }
+  return latest
+}
+
+export async function getAgentStatus(
+  port: number,
+  options: ThreadRouterOptions = {},
+): Promise<'running' | 'stable'> {
+  const fetchImpl = options.fetch || fetch
+  const body = await fetchJson<AgentStatusBody>(fetchImpl, `http://127.0.0.1:${port}/status`)
+  if (body.status !== 'running' && body.status !== 'stable') {
+    throw new Error(`Unexpected agentapi status: ${String(body.status)}`)
+  }
+  return body.status
+}
+
+// Pre-POST liveness probe for a per-thread worker. A worker mid-turn reports
+// 'running' and would 500 a POST ("not waiting for user input"); probing first
+// lets the caller queue the new turn cleanly (with a "queued" placeholder)
+// instead of POST-thrashing and ultimately surfacing a delivery-failure notice.
+// 'running' → 'busy' (queue it); 'stable' → 'ready' (forward now). The probe can
+// throw while a worker is still spawning — callers fall through to forwardMessage,
+// whose own retry window covers that race (opshub#155).
+export async function probeWorkerForDelivery(
+  port: number,
+  options: ThreadRouterOptions = {},
+): Promise<'busy' | 'ready'> {
+  return (await getAgentStatus(port, options)) === 'running' ? 'busy' : 'ready'
+}
+
+async function isAgentHealthy(
+  port: number,
+  options: ThreadRouterOptions,
+): Promise<boolean> {
+  try {
+    await getAgentStatus(port, options)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function isThreadSessionHealthy(
+  key: string,
+  session: ThreadSession,
+  options: ThreadRouterOptions,
+  stateDir: string,
+): Promise<boolean> {
+  if (session.pid > 0 && !isPidAlive(session.pid, options)) return false
+  if (await hasFatalStartupStateFile(stateDir, key)) return false
+  return isAgentHealthy(session.port, options)
+}
+
+function isPidAlive(pid: number, options: ThreadRouterOptions): boolean {
+  return (options.pidIsAlive || defaultPidIsAlive)(pid)
+}
+
+async function hasFatalStartupStateFile(stateDir: string, key: string): Promise<boolean> {
+  const path = stateFilePathForKey(stateDir, key)
+  try {
+    const raw = await readFile(path, 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return false
+    const messages = (parsed as { messages?: unknown }).messages
+    if (!Array.isArray(messages) || messages.length === 0) return false
+    const hasUserMessage = messages.some((message) =>
+      Boolean(message && typeof message === 'object' && (message as { role?: unknown }).role === 'user'),
+    )
+    if (hasUserMessage) return false
+    return messages.some((message) =>
+      Boolean(
+        message &&
+        typeof message === 'object' &&
+        (message as { role?: unknown }).role === 'agent' &&
+        typeof (message as { message?: unknown }).message === 'string' &&
+        (
+          CLAUDE_SESSION_ALREADY_IN_USE_RE.test((message as { message: string }).message) ||
+          CLAUDE_UNKNOWN_PROVIDER_RE.test((message as { message: string }).message)
+        ),
+      ),
+    )
+  } catch {
+    return false
+  }
+}
+
+async function hasUnknownProviderStartupStateFile(stateDir: string, key: string): Promise<boolean> {
+  const path = stateFilePathForKey(stateDir, key)
+  try {
+    const raw = await readFile(path, 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return false
+    const messages = (parsed as { messages?: unknown }).messages
+    if (!Array.isArray(messages) || messages.length === 0) return false
+    const hasUserMessage = messages.some((message) =>
+      Boolean(message && typeof message === 'object' && (message as { role?: unknown }).role === 'user'),
+    )
+    if (hasUserMessage) return false
+    return messages.some((message) =>
+      Boolean(
+        message &&
+        typeof message === 'object' &&
+        (message as { role?: unknown }).role === 'agent' &&
+        typeof (message as { message?: unknown }).message === 'string' &&
+        CLAUDE_UNKNOWN_PROVIDER_RE.test((message as { message: string }).message),
+      ),
+    )
+  } catch {
+    return false
+  }
+}
+
+async function unlinkFatalStartupStateFile(stateDir: string, key: string): Promise<void> {
+  if (!await hasFatalStartupStateFile(stateDir, key)) return
+  try {
+    await unlink(stateFilePathForKey(stateDir, key))
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+}
+
+async function nextFreePort(
+  registry: ThreadSessionRegistry,
+  options: ThreadRouterOptions,
+): Promise<number> {
+  const basePort = options.basePort || DEFAULT_BASE_PORT
+  const maxPorts = options.maxPorts || DEFAULT_MAX_PORTS
+  const used = new Set(
+    Object.values(registry)
+      .filter((session) => session.status === 'active' || session.status === 'activating')
+      .map((session) => session.port),
+  )
+  const portIsAvailable = options.portIsAvailable || defaultPortIsAvailable
+
+  for (let offset = 0; offset < maxPorts; offset++) {
+    const port = basePort + offset
+    if (used.has(port)) continue
+    if (await portIsAvailable(port)) return port
+  }
+
+  throw new Error(`No free agentapi ports in range ${basePort}-${basePort + maxPorts - 1}`)
+}
+
+async function withRegistryLock<T>(
+  stateDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await mkdir(stateDir, { recursive: true, mode: 0o700 })
+  const lockPath = registryLockPath(stateDir)
+  await acquireLock(lockPath, stateDir)
+  try {
+    return await fn()
+  } finally {
+    try {
+      await unlink(lockPath)
+    } catch {
+      /* no-op */
+    }
+  }
+}
+
+async function acquireLock(lockPath: string, stateDir: string): Promise<void> {
+  const deadline = Date.now() + DEFAULT_LOCK_TIMEOUT_MS
+  const pollMs = DEFAULT_LOCK_POLL_MS
+
+  while (Date.now() <= deadline) {
+    try {
+      await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600, flag: 'wx' })
+      await chmod(lockPath, 0o600)
+      return
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      if (await isStaleLock(lockPath)) {
+        try {
+          await unlink(lockPath)
+          continue
+        } catch {
+          /* another process may have won the cleanup race */
+        }
+      }
+      await sleep(pollMs)
+    }
+  }
+
+  throw new Error(`Timed out acquiring thread session registry lock in ${stateDir}`)
+}
+
+async function isStaleLock(lockPath: string): Promise<boolean> {
+  try {
+    const raw = await readFile(lockPath, 'utf8')
+    const pid = Number.parseInt(raw.trim(), 10)
+    if (!pid || pid === process.pid) return true
+    process.kill(pid, 0)
+    return false
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ESRCH' || code === 'ENOENT') return true
+    if (code === 'EPERM') return false
+    return true
+  }
+}
+
+async function fetchJson<T>(
+  fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
+  url: string,
+  init?: RequestInit,
+): Promise<T> {
+  const response = await fetchImpl(url, init)
+  if (!response.ok) {
+    throw new Error(`agentapi request failed: ${response.status} ${response.statusText}`)
+  }
+  return await response.json() as T
+}
+
+// agentapi itself gates POST /message on the agent being ready for input (it
+// returns the "waiting for user input" 500 otherwise), so that gate — not a
+// /status read — is the authoritative readiness signal. (/status `stable` flips
+// transiently and is an unreliable proxy; see waitForSettledAgentMessageContent.)
+// We therefore wait for readiness by retrying the POST against agentapi's own
+// gate, bounded by messagePostRetryMs (opshub#155, Phase 5 follow-up).
+async function postAgentMessageWithRetry<T>(
+  fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
+  url: string,
+  init: RequestInit,
+  options: ThreadRouterOptions,
+): Promise<T> {
+  const now = options.now || Date.now
+  const retryMs = Math.max(0, options.messagePostRetryMs ?? DEFAULT_MESSAGE_POST_RETRY_TIMEOUT_MS)
+  const deadline = now() + retryMs
+  const pollMs = Math.max(
+    1,
+    Math.min(options.statusPollMs || DEFAULT_MESSAGE_POST_RETRY_POLL_MS, DEFAULT_MESSAGE_POST_RETRY_POLL_MS),
+  )
+
+  while (true) {
+    const response = await fetchImpl(url, init)
+    const rawBody = await response.text()
+    if (response.ok) {
+      return (rawBody ? JSON.parse(rawBody) : {}) as T
+    }
+
+    const isTransientStartupRace =
+      response.status === 500 && AGENT_WAITING_FOR_USER_INPUT_RE.test(rawBody)
+    const remainingMs = deadline - now()
+    if (!isTransientStartupRace || remainingMs <= 0) {
+      const detail = rawBody.trim() ? `: ${rawBody.trim()}` : ''
+      throw new Error(`agentapi request failed: ${response.status} ${response.statusText}${detail}`)
+    }
+
+    await sleep(Math.min(pollMs, remainingMs))
+  }
+}
+
+function defaultSpawnAgent(
+  command: string,
+  args: string[],
+  options: { cwd: string; detached: true; stdio: 'ignore'; env: NodeJS.ProcessEnv },
+): ChildProcess {
+  return nodeSpawn(command, args, options)
+}
+
+function defaultKillProcess(pid: number): void {
+  try {
+    process.kill(pid, 'TERM')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err
+  }
+}
+
+function defaultPidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return false
+    if (code === 'EPERM') return true
+    return false
+  }
+}
+
+function defaultPortIsAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = createServer()
+    server.once('error', () => resolve(false))
+    server.once('listening', () => {
+      server.close(() => resolve(true))
+    })
+    server.listen(port, '127.0.0.1')
+  })
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}

@@ -57,6 +57,17 @@ export interface Access {
   chunkMode?: 'length' | 'newline'
 }
 
+export interface OutboundThreadSession {
+  status?: unknown
+}
+
+export type OutboundThreadRegistry = Record<string, OutboundThreadSession>
+
+export interface OutboundGateOptions {
+  activeThreadRegistry?: OutboundThreadRegistry
+  threadTs?: string
+}
+
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
 export interface GateResult {
@@ -635,6 +646,31 @@ export function assertSendable(
 // Security — outbound gate
 // ---------------------------------------------------------------------------
 
+const ACTIVE_THREAD_SESSION_STATUSES = new Set(['active', 'activating'])
+
+function isActiveThreadSession(session: OutboundThreadSession | undefined): boolean {
+  return ACTIVE_THREAD_SESSION_STATUSES.has(String(session?.status || ''))
+}
+
+export function activeThreadRegistryAllowsOutbound(
+  chatId: string,
+  registry: OutboundThreadRegistry | undefined,
+  threadTs?: string,
+): boolean {
+  if (!chatId || !registry) return false
+  // Thread fetches are authorized at channel scope once any session is active.
+  void threadTs
+
+  for (const [key, session] of Object.entries(registry)) {
+    if (!isActiveThreadSession(session)) continue
+    const separator = key.indexOf(':')
+    if (separator <= 0) continue
+    if (key.slice(0, separator) === chatId) return true
+  }
+
+  return false
+}
+
 /**
  * Throws if `chatId` is neither an opted-in channel nor a previously-delivered
  * channel (DM that passed the inbound gate this session).
@@ -643,9 +679,19 @@ export function assertOutboundAllowed(
   chatId: string,
   access: Access,
   deliveredChannels: ReadonlySet<string>,
+  options: OutboundGateOptions = {},
 ): void {
   if (access.channels[chatId]) return
   if (deliveredChannels.has(chatId)) return
+  if (
+    activeThreadRegistryAllowsOutbound(
+      chatId,
+      options.activeThreadRegistry,
+      options.threadTs,
+    )
+  ) {
+    return
+  }
   throw new Error(
     `Outbound gate: channel ${chatId} is not in the allowlist or opted-in channels.`,
   )
@@ -698,6 +744,42 @@ export function chunkText(text: string, limit: number, mode: 'length' | 'newline
   }
 
   return chunks
+}
+
+// ---------------------------------------------------------------------------
+// Reply delivery planning
+// ---------------------------------------------------------------------------
+
+// Shown in place of a stranded "Working…" progress placeholder when a turn
+// finishes with no reply text to send (opshub#155, Phase 5 follow-up).
+export const EMPTY_REPLY_NOTICE = '(no reply)'
+
+// Shown in place of the progress placeholder when delivery to the thread worker
+// throws (POST/forward failure, activation race, or a Slack write error) so the
+// user is never stranded on an endless "Working…" (opshub#155, Phase 5 follow-up).
+export const DELIVERY_FAILURE_NOTICE =
+  '⚠️ Failed to deliver to the thread worker — please send your message again.'
+
+// A single Slack write the main router makes to deliver a finalized reply:
+// either update an existing message (the progress placeholder) or post a new
+// in-thread message.
+export type SlackDeliveryOp =
+  | { kind: 'update'; ts: string; text: string }
+  | { kind: 'post'; text: string }
+
+// Decide the Slack writes that finalize a reply. The first chunk reuses the
+// progress placeholder (`editTs`) via an in-place update so "Working…" becomes
+// the answer; remaining chunks post as new in-thread messages. An empty reply
+// repurposes the placeholder as a terminal notice so the user is never left on a
+// stale "Working…"; with no placeholder and no content there is nothing to do.
+export function planReplyDelivery(chunks: string[], editTs?: string): SlackDeliveryOp[] {
+  const nonEmpty = chunks.filter((chunk) => chunk.trim().length > 0)
+  if (nonEmpty.length === 0) {
+    return editTs ? [{ kind: 'update', ts: editTs, text: EMPTY_REPLY_NOTICE }] : []
+  }
+  return nonEmpty.map((text, index) =>
+    index === 0 && editTs ? { kind: 'update', ts: editTs, text } : { kind: 'post', text },
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -912,4 +994,30 @@ export function isDuplicateEvent(
 
   seen.set(key, now + ttlMs)
   return false
+}
+
+// ---------------------------------------------------------------------------
+// Slack MCP tool exposure policy
+// ---------------------------------------------------------------------------
+
+export const SLACK_MCP_OUTBOUND_TOOL_NAMES = ['reply', 'react', 'edit_message'] as const
+export const SLACK_MCP_READONLY_TOOL_NAMES = ['fetch_messages', 'download_attachment'] as const
+
+const SLACK_MCP_OUTBOUND_TOOL_SET = new Set<string>(SLACK_MCP_OUTBOUND_TOOL_NAMES)
+
+/**
+ * Returns true for MCP tools that directly mutate/post to Slack.
+ *
+ * The thread router posts agentapi output back to Slack itself. Thread-scoped
+ * child Claude sessions may still need Slack history/file read tools, but they
+ * must never bypass the router by calling reply/react/edit directly.
+ */
+export function isSlackMcpOutboundToolName(name: string): boolean {
+  return SLACK_MCP_OUTBOUND_TOOL_SET.has(name)
+}
+
+export function slackMcpToolNamesForMode(canSendOutbound: boolean): string[] {
+  return canSendOutbound
+    ? [...SLACK_MCP_OUTBOUND_TOOL_NAMES, ...SLACK_MCP_READONLY_TOOL_NAMES]
+    : [...SLACK_MCP_READONLY_TOOL_NAMES]
 }
