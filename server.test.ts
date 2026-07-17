@@ -3587,6 +3587,118 @@ describe('thread_router forwardMessage', () => {
     }
   }, 3_000)
 
+  test('delivers JSONL end_turn reply immediately even while agentapi stays running (opshub#155)', async () => {
+    // 2026-07-17 live incident: short Slack replies wrote final text with
+    // message.stop_reason "end_turn" into the session JSONL, but the router only
+    // treated a later real user turn (or self-send) as turnComplete. /messages
+    // stayed tui-scrollback-shaped, confirmJsonlCandidate saw status "running"
+    // (or a spinner) and rejected every candidate until the user sent the next
+    // message — "reply only appears after I send the next one".
+    const rawRoot = mkdtempSync(join(tmpdir(), 'thread-router-end-turn-'))
+    const cwd = join(rawRoot, 'repo')
+    const claudeProjectsDir = join(rawRoot, 'projects')
+    const meta = {
+      chat_id: 'D0ATZTYC3KN',
+      thread_ts: '1784248604.509899',
+      ts: '1784248604.509899',
+      message_id: '1784248604.509899',
+      user: 'casey',
+      user_id: 'U123',
+    }
+    const sessionId = claudeSessionIdForKey(buildSessionKey(meta.chat_id, meta.thread_ts))
+    const jsonlPath = claudeProjectSessionJsonlPath(cwd, sessionId, claudeProjectsDir)
+
+    try {
+      mkdirSync(dirname(jsonlPath), { recursive: true })
+      const fetchMock = async (url: string) => {
+        if (url.endsWith('/message')) {
+          // No second user turn — only stop_reason end_turn proves completion.
+          writeFileSync(
+            jsonlPath,
+            [
+              JSON.stringify({
+                type: 'user',
+                timestamp: new Date().toISOString(),
+                message: { role: 'user', content: '在吗' },
+              }),
+              // Thinking-only sibling also carries end_turn; must not finalize empty.
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(Date.now() + 5).toISOString(),
+                message: {
+                  model: 'grok-4.5-build',
+                  role: 'assistant',
+                  stop_reason: 'end_turn',
+                  content: [{ type: 'thinking', thinking: 'short ack' }],
+                },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(Date.now() + 10).toISOString(),
+                message: {
+                  model: 'grok-4.5-build',
+                  role: 'assistant',
+                  stop_reason: 'end_turn',
+                  content: [{ type: 'text', text: '在的，有事直接说。' }],
+                },
+              }),
+            ].join('\n') + '\n',
+          )
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/status')) {
+          // agentapi remains running after the model finished (PTY lag / spinner).
+          return new Response(JSON.stringify({ status: 'running' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.endsWith('/messages')) {
+          // Force JSONL fallback via tui-scrollback-shaped inbound echo.
+          return new Response(
+            JSON.stringify({
+              messages: [{
+                id: 2,
+                role: 'agent',
+                content:
+                  '← slack · 在吗\n在的，有事直接说。\n✽ Embellishing… (3s · ↓ 1.4k tokens)\n37% context used',
+                time: '2026-07-17T00:37:12.000Z',
+              }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      }
+
+      const reply = await forwardMessage(
+        3099,
+        '在吗',
+        {
+          fetch: fetchMock,
+          cwd,
+          claudeProjectsDir,
+          includeSlackContext: false,
+          statusPollMs: 1,
+          messageSettleMs: 0,
+          replyRepollMs: 0,
+          emptyReprobeDelayMs: 1,
+          emptyStableProbeLimit: 50,
+          candidateConfirmMs: 20_000,
+          forwardTimeoutMs: 2_000,
+        },
+        meta,
+      )
+
+      expect(reply).toBe('在的，有事直接说。\n\n37% context used')
+    } finally {
+      rmSync(rawRoot, { recursive: true, force: true })
+    }
+  }, 3_000)
+
   test('extracts real answer when worker enters self-send tool-call loop (opshub#155)', async () => {
     // 2026-07-08 live incident: the worker generated a valid reply then tried
     // to deliver it itself via `claude mcp call slack reply`, which failed with

@@ -868,11 +868,16 @@ export async function runDeliveryDrainLoop(options: {
 }
 
 // Scans the session JSONL for the forwarded turn's reply. `text` is the last
-// assistant text inside the turn's window; `turnComplete` reports whether a
-// LATER real inbound turn was recorded. claude-code only records an inbound
-// turn when it starts consuming it, so its presence proves the window closed
-// and `text` is the turn's final reply — deliverable without any worker-quiet
-// confirmation (opshub#155 livelock, 2026-07-06).
+// assistant text inside the turn's window; `turnComplete` reports whether that
+// text is the turn's final reply (deliverable without a worker-quiet confirm).
+// Complete when any of:
+//   1. a later real inbound turn was recorded (claude-code only writes it once
+//      it starts consuming the next turn — opshub#155 livelock, 2026-07-06)
+//   2. the worker self-sent via `claude mcp call` (opshub#155, 2026-07-08)
+//   3. the latest deliverable assistant record has stop_reason `end_turn`
+//      (live 2026-07-17: agentapi stayed `running`/spinner-visible after the
+//      model finished, so candidate-confirm kept rejecting until the next
+//      user message flushed the prior reply)
 async function scanClaudeJsonlTurnReply(
   state: ClaudeJsonlFallbackState,
 ): Promise<{ text: string | undefined; turnComplete: boolean }> {
@@ -936,9 +941,24 @@ async function scanClaudeJsonlTurnReply(
       turnComplete = true
       break
     }
+    // Model-finished signal: stop_reason end_turn is written when the assistant
+    // message is done. Require deliverable text so a thinking-only sibling that
+    // also carries end_turn cannot finalize an empty candidate before the text
+    // record lands. stop_reason tool_use stays incomplete (more work follows).
+    if (assistantStopReason(record) === 'end_turn' && latestText) {
+      turnComplete = true
+      break
+    }
   }
 
   return { text: latestText, turnComplete }
+}
+
+function assistantStopReason(record: Record<string, unknown>): string | undefined {
+  const message = record['message']
+  if (!message || typeof message !== 'object') return undefined
+  const stopReason = (message as Record<string, unknown>)['stop_reason']
+  return typeof stopReason === 'string' ? stopReason : undefined
 }
 
 function extractClaudeAssistantText(record: Record<string, unknown>): string {
