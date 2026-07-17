@@ -1023,25 +1023,25 @@ export function slackMcpToolNamesForMode(canSendOutbound: boolean): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Slack → Claude Code slash bridge (allowlisted ops)
+// Slack → Claude Code slash bridge
 // ---------------------------------------------------------------------------
-
-/** Read-only Claude Code slash commands that may be invoked from Slack. */
-export const SLASH_BRIDGE_COMMANDS = new Set(['usage'])
 
 /**
  * Parse a Slack message that should become a Claude Code slash command.
  *
- * Requires the two-character prefix `#/` (e.g. `#/usage`). A lone `#usage`
- * or `/usage` is intentionally not matched so normal chat and Claude-style
- * single-slash text stay ordinary messages.
- * Returns the lowercased command name when it is on the whitelist; otherwise
- * undefined so the message falls through to normal chat delivery.
+ * Requires the two-character prefix `#/` (e.g. `#/usage`, `#/grill-me`).
+ * A lone `#usage` or `/usage` is intentionally not matched so normal chat
+ * and Claude-style single-slash text stay ordinary messages.
+ *
+ * Returns the lowercased command name (letters/digits/_/- only, max 32 chars)
+ * for any such token — no allowlist. Unknown commands still get injected as
+ * `/name`; Claude Code itself reports "unknown slash command" if it doesn't
+ * exist. Free-form args after the name are rejected so this cannot become a
+ * general prompt injection channel.
  */
 export function parseSlashBridgeCommand(text: string): string | undefined {
   const trimmed = text.trim()
   const match = /^#\/([a-z][a-z0-9_-]{0,31})\s*$/i.exec(trimmed)
   if (!match) return undefined
-  const name = match[1].toLowerCase()
-  return SLASH_BRIDGE_COMMANDS.has(name) ? name : undefined
+  return match[1].toLowerCase()
 }
