@@ -49,6 +49,7 @@ import {
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   isSlackMcpOutboundToolName,
+  parseSlashBridgeCommand,
   type Access,
   type GateResult,
   type OutboundThreadRegistry,
@@ -1289,9 +1290,14 @@ async function handleMessage(event: unknown): Promise<void> {
         return // Don't forward as chat
       }
 
-      // Admin commands from allowlisted users — intercept before normal delivery
+      // Admin / slash-bridge commands from allowlisted users — intercept before
+      // normal delivery so they never become free-form chat turns.
       if (result.access!.allowFrom.includes(ev['user'] as string)) {
-        const cmd = msgText.toLowerCase()
+        let cmdText = msgText
+        if (botUserId) {
+          cmdText = cmdText.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
+        }
+        const cmd = cmdText.toLowerCase()
         if (cmd === '!clear' || cmd === '!restart') {
           const tmuxSession = process.env.SLACK_TMUX_SESSION || 'slack'
           try {
@@ -1307,6 +1313,48 @@ async function handleMessage(event: unknown): Promise<void> {
             })
           } catch (err) {
             console.error(`[slack] admin command ${cmd} failed:`, err)
+          }
+          return
+        }
+
+        // `#usage` / `/usage` → inject Claude Code slash into the thread worker
+        // and post the captured output back (opshub#78).
+        const slashName = parseSlashBridgeCommand(cmdText)
+        if (slashName) {
+          const threadTs =
+            (ev['thread_ts'] as string | undefined) || (ev['ts'] as string)
+          try {
+            await web.reactions.add({
+              channel: channelId,
+              timestamp: ev['ts'] as string,
+              name: 'mag',
+            })
+          } catch { /* non-critical */ }
+          try {
+            const session = await ensureSession(channelId, threadTs)
+            // Raw slash text (no <channel> wrap) so Claude Code treats it as /usage.
+            const replyText = await forwardMessage(
+              session.port,
+              `/${slashName}`,
+              { includeSlackContext: false },
+            )
+            const body = (replyText || '').trim() || `(no output from /${slashName})`
+            await sendReplyToSlack({
+              chatId: channelId,
+              text: body,
+              threadTs,
+            })
+          } catch (err) {
+            console.error(`[slack] slash bridge /${slashName} failed:`, err)
+            try {
+              await web.chat.postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: `Failed to run \`/${slashName}\`: ${err instanceof Error ? err.message : String(err)}`,
+                unfurl_links: false,
+                unfurl_media: false,
+              })
+            } catch { /* non-critical */ }
           }
           return
         }

@@ -1021,3 +1021,25 @@ export function slackMcpToolNamesForMode(canSendOutbound: boolean): string[] {
     ? [...SLACK_MCP_OUTBOUND_TOOL_NAMES, ...SLACK_MCP_READONLY_TOOL_NAMES]
     : [...SLACK_MCP_READONLY_TOOL_NAMES]
 }
+
+// ---------------------------------------------------------------------------
+// Slack → Claude Code slash bridge (allowlisted ops)
+// ---------------------------------------------------------------------------
+
+/** Read-only Claude Code slash commands that may be invoked from Slack. */
+export const SLASH_BRIDGE_COMMANDS = new Set(['usage'])
+
+/**
+ * Parse a Slack message that should become a Claude Code slash command.
+ *
+ * Accepts `#usage` or `/usage` (optional surrounding whitespace only).
+ * Returns the lowercased command name when it is on the whitelist; otherwise
+ * undefined so the message falls through to normal chat delivery.
+ */
+export function parseSlashBridgeCommand(text: string): string | undefined {
+  const trimmed = text.trim()
+  const match = /^(?:#|\/)([a-z][a-z0-9_-]{0,31})\s*$/i.exec(trimmed)
+  if (!match) return undefined
+  const name = match[1].toLowerCase()
+  return SLASH_BRIDGE_COMMANDS.has(name) ? name : undefined
+}
