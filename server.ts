@@ -1317,8 +1317,8 @@ async function handleMessage(event: unknown): Promise<void> {
           return
         }
 
-        // `#usage` / `/usage` → inject Claude Code slash into the thread worker
-        // and post the captured output back (opshub#78).
+        // `#/usage` → inject Claude Code slash into the thread worker and post
+        // the captured output back (opshub#78). Requires both `#` and `/`.
         const slashName = parseSlashBridgeCommand(cmdText)
         if (slashName) {
           const threadTs =
