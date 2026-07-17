@@ -25,6 +25,7 @@ import {
   PAIRING_EXPIRY_MS,
   isSlackMcpOutboundToolName,
   slackMcpToolNamesForMode,
+  parseSlashBridgeCommand,
   planReplyDelivery,
   EMPTY_REPLY_NOTICE,
   type Access,
@@ -624,6 +625,26 @@ describe('parseSendableRoots', () => {
 
   test('silently drops empty entries', () => {
     expect(parseSendableRoots('/tmp/foo::/var/bar')).toEqual(['/tmp/foo', '/var/bar'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseSlashBridgeCommand() — Slack #usage / /usage → Claude Code slash
+// ---------------------------------------------------------------------------
+
+describe('parseSlashBridgeCommand', () => {
+  test('accepts #usage and /usage', () => {
+    expect(parseSlashBridgeCommand('#usage')).toBe('usage')
+    expect(parseSlashBridgeCommand('/usage')).toBe('usage')
+    expect(parseSlashBridgeCommand('  #Usage  ')).toBe('usage')
+  })
+
+  test('rejects unknown and free-form commands', () => {
+    expect(parseSlashBridgeCommand('#exit')).toBeUndefined()
+    expect(parseSlashBridgeCommand('/clear')).toBeUndefined()
+    expect(parseSlashBridgeCommand('#usage please')).toBeUndefined()
+    expect(parseSlashBridgeCommand('usage')).toBeUndefined()
+    expect(parseSlashBridgeCommand('!usage')).toBeUndefined()
   })
 })
 
