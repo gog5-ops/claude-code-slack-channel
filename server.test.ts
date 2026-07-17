@@ -3621,15 +3621,27 @@ describe('thread_router forwardMessage', () => {
                 timestamp: new Date().toISOString(),
                 message: { role: 'user', content: '在吗' },
               }),
-              // Thinking-only sibling also carries end_turn; must not finalize empty.
+              // Mid-turn tool_use narration must not be finalized by a later
+              // thinking-only end_turn sibling (live 2026-07-17: delivered
+              // "先看一眼…" and skipped the real final text record).
               JSON.stringify({
                 type: 'assistant',
                 timestamp: new Date(Date.now() + 5).toISOString(),
                 message: {
                   model: 'grok-4.5-build',
                   role: 'assistant',
+                  stop_reason: 'tool_use',
+                  content: [{ type: 'text', text: '先看一眼 live 和最新 router.log' }],
+                },
+              }),
+              JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(Date.now() + 8).toISOString(),
+                message: {
+                  model: 'grok-4.5-build',
+                  role: 'assistant',
                   stop_reason: 'end_turn',
-                  content: [{ type: 'thinking', thinking: 'short ack' }],
+                  content: [{ type: 'thinking', thinking: 'compose final status' }],
                 },
               }),
               JSON.stringify({

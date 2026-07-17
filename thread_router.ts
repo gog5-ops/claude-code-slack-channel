@@ -942,10 +942,17 @@ async function scanClaudeJsonlTurnReply(
       break
     }
     // Model-finished signal: stop_reason end_turn is written when the assistant
-    // message is done. Require deliverable text so a thinking-only sibling that
-    // also carries end_turn cannot finalize an empty candidate before the text
-    // record lands. stop_reason tool_use stays incomplete (more work follows).
-    if (assistantStopReason(record) === 'end_turn' && latestText) {
+    // message is done. Require THIS record's deliverable text — not merely any
+    // earlier latestText. Live 2026-07-17: a thinking-only end_turn sibling
+    // arrived while latestText still held mid-turn tool_use narration
+    // ("先看一眼…"); completing on latestText finalized the narration and
+    // skipped the real final text record that followed. stop_reason tool_use
+    // stays incomplete (more work follows).
+    if (
+      assistantStopReason(record) === 'end_turn' &&
+      assistantText &&
+      !isIgnoredClaudeAssistantText(assistantText)
+    ) {
       turnComplete = true
       break
     }
